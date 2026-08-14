@@ -1,0 +1,17 @@
+# 依赖与构建产物
+node_modules/
+dist/
+
+# 日志与临时文件
+*.log
+*.blockmap
+builder-debug.yml
+
+# 测试产物
+smoke-*.json
+upd-*.json
+
+# 系统杂项
+.DS_Store
+Thumbs.db
+desktop.ini

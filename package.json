@@ -1,0 +1,68 @@
+{
+  "name": "deepseek-harness-desktop",
+  "version": "1.0.0",
+  "description": "DeepSeek Harness 桌面应用 —— 双击启动 DSH Web 界面的原生窗口应用（黑鲸鱼图标）",
+  "main": "src/main.js",
+  "author": {
+    "name": "DSH Desktop",
+    "email": "dsh-desktop@localhost"
+  },
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "icon": "node scripts/make-icon.js",
+    "pack": "electron-builder --win --x64",
+    "dist": "electron-builder --win --x64"
+  },
+  "devDependencies": {
+    "electron": "43.4.0",
+    "electron-builder": "26.15.3",
+    "png-to-ico": "3.0.2",
+    "sharp": "0.35.3"
+  },
+  "build": {
+    "appId": "com.deepseek.harness.desktop",
+    "productName": "DeepSeek Harness",
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "src/**/*",
+      "build/icon.png",
+      "package.json"
+    ],
+    "asar": true,
+    "compression": "normal",
+    "win": {
+      "icon": "icon.ico",
+      "target": [
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "portable": {
+      "artifactName": "DeepSeek-Harness-${version}-portable.exe"
+    },
+    "nsis": {
+      "artifactName": "DeepSeek-Harness-${version}-setup.exe",
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "DeepSeek Harness"
+    }
+  }
+}
