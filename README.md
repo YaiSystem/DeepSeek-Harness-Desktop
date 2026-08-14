@@ -36,4 +36,4 @@ DeepSeek Harness 是一个 AI 编程助手，官方以命令行工具的形式�
 
 ## 开发者
 
-打包：`npm install` 之后执行 `npm run pack`。
+打包：`npm install` 后依次执行 `npm run prepare`（准备内置运行环境，仅首次需要）和 `npm run pack`。
