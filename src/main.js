@@ -72,6 +72,10 @@ const state = {
   updateChecked: false,
 };
 
+// 测试/隔离用：指定独立 userData 目录，避免与正在使用的实例抢单实例锁
+const userDataDirArg = getArg('--user-data-dir');
+if (userDataDirArg) app.setPath('userData', userDataDirArg);
+
 app.setName(APP_NAME);
 
 // ---------------------------------------------------------------- logging
@@ -186,6 +190,31 @@ function existingFile(p) {
   }
 }
 
+// 内置的 Node 与 DSH 核心（打包进应用 resources，零前提条件兜底）
+const NODE_DIR_NAME = 'node-v24.19.0-win-x64';
+
+function bundledBase() {
+  return app.isPackaged ? process.resourcesPath : path.join(__dirname, '..', 'resources');
+}
+
+function bundledNodePath() {
+  return path.join(bundledBase(), 'node', NODE_DIR_NAME, 'node.exe');
+}
+
+function bundledNodeDir() {
+  return path.join(bundledBase(), 'node', NODE_DIR_NAME);
+}
+
+function bundledDshBinJs() {
+  return path.join(bundledBase(), 'dsh', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js');
+}
+
+// 给定 node.exe，返回其同目录自带的 npm 执行参数组（绿色版 Node 都自带 npm）
+function npmCliArgsFor(nodePath) {
+  const npmCli = path.join(path.dirname(nodePath), 'node_modules', 'npm', 'bin', 'npm-cli.js');
+  return existingFile(npmCli) ? [nodePath, npmCli] : null;
+}
+
 function findNode() {
   const envNode = process.env.DSH_NODE;
   if (existingFile(envNode)) return envNode;
@@ -201,7 +230,8 @@ function findNode() {
   }
   const cached = loadCliCache().node;
   if (existingFile(cached)) return cached;
-  return null;
+  // 兜底：应用内置的 Node（安装包自带，无需用户装任何东西）
+  return existingFile(bundledNodePath());
 }
 
 function findDshBinJs() {
@@ -232,6 +262,8 @@ function findDshBinJs() {
   if (pf86) candidates.push(path.join(pf86, 'nodejs', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js'));
   const cached = loadCliCache().binJs;
   if (cached) candidates.push(cached);
+  // 兜底：应用内置的 DSH 核心
+  candidates.push(bundledDshBinJs());
   for (const cand of candidates) {
     if (existingFile(cand)) return cand;
   }
@@ -333,8 +365,12 @@ function killChildTree() {
 function startServer(nodePath, binJs, port) {
   return new Promise((resolve, reject) => {
     log(`spawning: ${nodePath} ${binJs} web --host 127.0.0.1 --port ${port}`);
+    // 把内置 Node 目录放在 PATH 最前：DSH 内部子进程按 PATH 找 node 时也一定找得到
+    const nodeDir = path.dirname(nodePath);
+    const childEnv = { ...process.env };
+    childEnv.PATH = `${nodeDir}${path.delimiter}${process.env.PATH || ''}`;
     const child = spawn(nodePath, [binJs, 'web', '--host', '127.0.0.1', '--port', String(port)], {
-      env: process.env,
+      env: childEnv,
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
     });
@@ -625,12 +661,21 @@ function runNpmInstall(targetVersion) {
     const exec = (args) =>
       new Promise((res2) => {
         log(`npm ${args.join(' ')}`);
-        const child = spawn('npm', args, {
-          shell: true,
-          env: process.env,
-          windowsHide: true,
-          stdio: ['ignore', 'pipe', 'pipe'],
-        });
+        // 优先用解析出的 Node 自带的 npm（内置/系统 Node 都自带），没有才退回 PATH 上的 npm
+        const nodePath = findNode();
+        const bundledNpm = nodePath ? npmCliArgsFor(nodePath) : null;
+        const child = bundledNpm
+          ? spawn(bundledNpm[0], [...bundledNpm.slice(1), ...args], {
+              env: process.env,
+              windowsHide: true,
+              stdio: ['ignore', 'pipe', 'pipe'],
+            })
+          : spawn('npm', args, {
+              shell: true,
+              env: process.env,
+              windowsHide: true,
+              stdio: ['ignore', 'pipe', 'pipe'],
+            });
         const out = [];
         const collect = (d) => {
           const clean = String(d).replace(/\x1b\[[0-9;]*m/g, '');

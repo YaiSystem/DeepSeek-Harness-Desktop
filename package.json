@@ -1,6 +1,6 @@
 {
   "name": "deepseek-harness-desktop",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "DeepSeek Harness 桌面应用 —— 双击启动 DSH Web 界面的原生窗口应用（黑鲸鱼图标）",
   "main": "src/main.js",
   "author": {
@@ -12,6 +12,7 @@
   "scripts": {
     "start": "electron .",
     "icon": "node scripts/make-icon.js",
+    "prepare": "node scripts/prepare-resources.js",
     "pack": "electron-builder --win --x64",
     "dist": "electron-builder --win --x64"
   },
@@ -32,6 +33,16 @@
       "src/**/*",
       "build/icon.png",
       "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "resources/node",
+        "to": "node"
+      },
+      {
+        "from": "resources/dsh",
+        "to": "dsh"
+      }
     ],
     "asar": true,
     "compression": "normal",
