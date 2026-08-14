@@ -1,70 +1,71 @@
-# DeepSeek Harness 桌面应用
+# DeepSeek Harness Desktop 🐳
 
-把 DeepSeek Harness（DSH）做成双击即用的 Windows 桌面应用，图标为**黑色鲸鱼**（DeepSeek 官方鲸鱼标志改色）。
+把 DeepSeek Harness 装进一个真正的 Windows 桌面应用——**双击黑鲸鱼图标就能用**，不用敲命令、不用开终端。
 
-## 使用
+DeepSeek Harness 本身是一个命令行工具，这个项目给它包了一层桌面外壳，让它变成普通用户也能直接使用的软件。
 
-- **双击** `dist\DeepSeek-Harness-1.0.0-portable.exe` 直接运行（绿色版，无需安装）。
-- 或者运行 `dist\DeepSeek-Harness-1.0.0-setup.exe` 安装（开始菜单 + 桌面快捷方式）。
+## 🎁 功能亮点
 
-## 与 GitHub 同步更新
+| 功能 | 说明 |
+|---|---|
+| 🖱 双击即用 | 双击图标自动完成所有准备工作，几秒后直接进入对话界面 |
+| 🐳 黑色鲸鱼图标 | 由 DeepSeek 官方鲸鱼标志改色而来，应用图标、任务栏、安装包全程统一 |
+| 🔄 自动更新 | 每次打开都会检查上游版本（与官方 GitHub 仓库的发布完全同步），发现新版本弹窗提示，一键升级 |
+| 🇨🇳 全中文 | 界面提示、工具简介、参数说明、推理过程全部中文 |
+| 🔌 智能接入 | 已经有服务在运行就直接接进去用；没有就自动拉起；端口被占用会自动换一个空闲端口 |
+| 🪟 单实例 | 重复双击只会把已打开的窗口调到前台，不会开出一堆窗口 |
+| 🧹 干净退出 | 应用自己拉起的服务会跟着窗口一起退出，不留后台残留 |
 
-本应用的核心引擎是 npm 全局包 `@deepseek-ai/dsh`（上游即 GitHub 仓库
-`deepseek-ai/deepseek-harness`，GitHub 更新后通过 npm 发布新版本）。
-应用通过 npm registry 与 GitHub 发布保持同步：
+## 📥 下载与安装
 
-- **启动自动检查**：窗口打开约 2.5 秒后后台检查一次，发现新版本弹出提示：
-  「立即更新 / 稍后提醒 / 跳过该版本」（跳过的版本不会重复打扰）。
-- **一键更新**：「立即更新」在后台执行
-  `npm install -g @deepseek-ai/dsh@<新版本>`，自动处理 npm 的
-  allow-scripts 脚本白名单（检测到拦截会按 npm 给出的精确列表重装一次，
-  保证原生模块与子进程 helper 完整构建）。
-  - 应用自己启动的服务 → 更新后**自动重启服务**，立即生效；
-  - 接入的既有服务 → 提示重启该服务后生效。
-- **手动检查**：菜单「帮助 → 检查更新」；「帮助 → 关于」显示外壳版本与核心版本。
-- 跳过/更新状态记录在 `%APPDATA%\DeepSeek Harness\update-state.json`。
+前往 [Releases](https://github.com/YaiSystem/DeepSeek-Harness-Desktop/releases) 页面，下载最新的 `DeepSeek-Harness-x.x.x-setup.exe`：
 
-## 工作原理
+1. 双击运行安装程序
+2. 安装完成后，桌面和开始菜单都会出现「DeepSeek Harness」
+3. 双击图标即可使用
 
-应用启动时会：
+> 💡 第一次运行如果 Windows SmartScreen 提示「已保护你的电脑」，这是未签名应用的正常提示：点「更多信息 → 仍要运行」即可。
 
-1. 探测 `127.0.0.1:3080`（或 `DSH_PORT` 指定的端口）是否已有 DSH 服务：
-   - **已存在** → 直接接入，窗口只是该服务的原生外壳；退出应用不会关掉它。
-   - **不存在** → 自动定位本机安装的 `dsh`（全局 npm 安装），以
-     `dsh web --host 127.0.0.1 --port <端口>` 方式在后台启动服务，
-     就绪后打开窗口；**关闭窗口会连同服务进程一起退出**。
-2. 端口被其他程序占用时，自动换一个空闲端口启动。
-3. 单实例：重复双击只会聚焦已打开的窗口。
+## 🚀 使用
 
-## 目录结构
+1. 双击桌面的「DeepSeek Harness」图标
+2. 看到黑色鲸鱼启动画面，稍等几秒
+3. 主窗口打开后，像使用网页版一样开始对话即可
 
+**关于更新**：上游（GitHub 官方仓库）发布新版本后，打开应用时会弹出更新提示，点「立即更新」等待完成即可；也可以随时在菜单「帮助 → 检查更新」手动检查。
+
+## ❓ 常见问题
+
+**打开时提示「Windows 已保护你的电脑」？**
+应用未做代码签名，这是正常提示，选择「仍要运行」。
+
+**点了「立即更新」后提示「重启服务后生效」？**
+说明当前窗口连接的是另一个已经在运行的服务，更新已下载完成，重启那个服务后即生效。
+
+**双击后一直停在启动画面？**
+应用需要本机装有 Node.js 和 DeepSeek Harness 命令行工具。首次使用前请在终端执行：
 ```
-package.json          Electron 工程与 electron-builder 打包配置
-src/main.js           主进程：服务探测/启动、窗口、生命周期
-src/splash.html       启动画面（黑色鲸鱼 + 加载动画）
-scripts/make-icon.js  图标生成脚本（SVG → PNG/ICO，并与官方图标做形状比对）
-build/icon.svg        黑色鲸鱼矢量母版
-build/icon.png        512x512 图标
-build/icon.ico        多尺寸 Windows 图标（16–256）
-dist/                 打包产物（portable + 安装包）
+npm install -g @deepseek-ai/dsh
 ```
 
-## 开发
+**为什么有时打开很快、有时要等？**
+如果电脑上已经有服务在运行，应用会直接接入（打开很快）；否则需要先帮你把服务拉起来（会多等几秒）。这是正常现象。
+
+**关掉窗口会把我正在跑的服务关掉吗？**
+如果是应用自己拉起的服务，会一起关闭；如果是接入的已有服务，不会动它。
+
+## 🛠 开发者
+
+重新打包：
 
 ```powershell
-npm install                 # 安装依赖（electron / electron-builder / sharp / png-to-ico）
-npm run icon                # 重新生成图标
-npm start                   # 开发模式运行
-npm run pack                # 打包（portable + nsis）
+npm install
+npm run icon    # 重新生成黑色鲸鱼图标
+npm run pack    # 打包安装版
 ```
 
-开发/排障参数：
-
-- `--smoke-test`：启动、加载页面、把结果写入 JSON 后自动退出（0=成功）。
-- `--smoke-log <path>`：smoke 报告输出位置。
-- `--port <n>`：指定服务端口（默认 3080，或环境变量 `DSH_PORT`）。
-- `--update-check-test <path>`：只跑更新检查并写出决策 JSON（不弹窗、不建窗口）。
-- `--update-install-test <prefix>`：把最新版安装到临时 prefix 验证更新命令（不触碰全局安装）。
-- 环境变量 `DSH_CLI` / `DSH_NODE`：手动指定 dsh 的 `lib/bin.js` 与 `node.exe`。
-- 环境变量 `DSH_UPDATE_URL`：覆盖更新检查地址（测试用）。
-- 日志：`%APPDATA%\DeepSeek Harness\logs\`（main.log、cli-cache.json）。
+国内网络打包时建议先设置镜像：
+```powershell
+$env:ELECTRON_MIRROR='https://npmmirror.com/mirrors/electron/'
+$env:ELECTRON_BUILDER_BINARIES_MIRROR='https://npmmirror.com/mirrors/electron-builder-binaries/'
+```
