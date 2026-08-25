@@ -364,12 +364,13 @@ function killChildTree() {
 
 function startServer(nodePath, binJs, port) {
   return new Promise((resolve, reject) => {
-    log(`spawning: ${nodePath} ${binJs} web --host 127.0.0.1 --port ${port}`);
+    log(`spawning: ${nodePath} ${binJs} web --host 127.0.0.1 --port ${port} --no-open`);
     // 把内置 Node 目录放在 PATH 最前：DSH 内部子进程按 PATH 找 node 时也一定找得到
     const nodeDir = path.dirname(nodePath);
     const childEnv = { ...process.env };
     childEnv.PATH = `${nodeDir}${path.delimiter}${process.env.PATH || ''}`;
-    const child = spawn(nodePath, [binJs, 'web', '--host', '127.0.0.1', '--port', String(port)], {
+    // --no-open：服务启动时不自动打开默认浏览器（这是应用自己的窗口干的事）
+    const child = spawn(nodePath, [binJs, 'web', '--host', '127.0.0.1', '--port', String(port), '--no-open'], {
       env: childEnv,
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
@@ -623,22 +624,26 @@ function promptUpdate(installed, latest) {
 function createUpdateWindow() {
   const html = `<!doctype html><html><head><meta charset="utf-8"><style>
     html,body{margin:0;height:100%;background:#0b0b10;font-family:"Segoe UI","Microsoft YaHei",system-ui,sans-serif;overflow:hidden}
-    .wrap{height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:18px}
-    .spinner{width:26px;height:26px;border:3px solid #33333f;border-top-color:#9aa0b4;border-radius:50%;animation:spin .9s linear infinite}
-    .title{color:#e8e8ee;font-size:15px;font-weight:600}
-    .sub{color:#8a8a98;font-size:12px}
-    @keyframes spin{to{transform:rotate(360deg)}}
+    .wrap{height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;padding:0 36px}
+    .title{color:#e8e8ee;font-size:15px;font-weight:600;text-align:center}
+    .bar{width:100%;height:8px;border-radius:4px;background:#232330;overflow:hidden}
+    .fill{height:100%;width:0%;border-radius:4px;background:#4d6bfe;transition:width .3s ease}
+    .fill.indeterminate{width:35%!important;animation:slide 1.2s ease-in-out infinite}
+    .pct{color:#8a8a98;font-size:12px}
+    .status{color:#9aa0b4;font-size:13px;text-align:center;max-width:340px;word-break:break-all}
+    @keyframes slide{0%{margin-left:-35%}100%{margin-left:100%}}
   </style></head><body><div class="wrap">
-    <div class="spinner"></div><div class="title">正在更新 DeepSeek Harness</div>
-    <div class="sub">正在通过 npm 同步 GitHub 最新版本，请稍候…</div>
+    <div class="title">正在更新 DeepSeek Harness</div>
+    <div class="bar"><div class="fill indeterminate" id="fill"></div></div>
+    <div class="pct" id="pct"></div>
+    <div class="status" id="status">正在检查依赖版本…</div>
   </div></body></html>`;
   const win = new BrowserWindow({
-    width: 420,
-    height: 280,
+    width: 460,
+    height: 260,
     frame: false,
     resizable: false,
     show: false,
-    alwaysOnTop: true,
     backgroundColor: '#0b0b10',
     webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false },
   });
@@ -649,14 +654,28 @@ function createUpdateWindow() {
   return win;
 }
 
-function runNpmInstall(targetVersion) {
+// 更新窗口的进度刷新（pct 为 null 时用动画条）
+function updateProgress(win, statusText, pct) {
+  if (!win || win.isDestroyed()) return;
+  const script = `(function(){
+    var s=document.getElementById('status'); if(s) s.textContent=${JSON.stringify(String(statusText || ''))};
+    var f=document.getElementById('fill'); var p=document.getElementById('pct');
+    if(${pct === null ? 'true' : 'false'}){ if(f){f.classList.add('indeterminate');} if(p){p.textContent='';} }
+    else{ if(f){f.classList.remove('indeterminate'); f.style.width=String(${pct})+ '%';} if(p){p.textContent=String(${pct})+ '%';} }
+  })()`;
+  win.webContents.executeJavaScript(script).catch(() => {});
+}
+
+function runNpmInstall(targetVersion, onProgress) {
+  const progress = onProgress || (() => {});
   return new Promise((resolve) => {
     // 版本号必须形如 x.y.z(-pre)，防止被上游伪造字符串注入命令
     if (!parseVersion(targetVersion)) {
       resolve({ ok: false, error: `非法版本号：${targetVersion}`, log: [] });
       return;
     }
-    const base = ['install', '-g', `${DSH_PACKAGE}@${targetVersion}`, '--no-audit', '--no-fund'];
+    // 国内镜像显著加快下载；--allow-scripts=all 让原生模块构建脚本一次跑完（避免第二轮重装）
+    const base = ['install', '-g', `${DSH_PACKAGE}@${targetVersion}`, '--no-audit', '--no-fund', '--registry=https://registry.npmmirror.com', '--allow-scripts=all'];
 
     const exec = (args) =>
       new Promise((res2) => {
@@ -677,10 +696,21 @@ function runNpmInstall(targetVersion) {
               stdio: ['ignore', 'pipe', 'pipe'],
             });
         const out = [];
+        let reified = 0;
         const collect = (d) => {
           const clean = String(d).replace(/\x1b\[[0-9;]*m/g, '');
           for (const line of clean.split(/\r?\n/)) {
-            if (line.trim()) out.push(line.trim());
+            const t = line.trim();
+            if (!t) continue;
+            out.push(t);
+            if (/^reify:/i.test(t)) {
+              reified += 1;
+              progress(`正在安装依赖（已处理 ${reified} 个包）…`, null);
+            } else if (/http fetch/i.test(t)) {
+              progress('正在下载依赖包…', null);
+            } else if (/added \d+ packages/i.test(t)) {
+              progress('依赖安装完成，正在收尾…', 90);
+            }
           }
           if (out.length > 200) out.splice(0, out.length - 200);
           log(`[npm] ${clean.trimEnd()}`);
@@ -702,6 +732,7 @@ function runNpmInstall(targetVersion) {
         });
       });
 
+    progress('正在检查依赖版本…', null);
     exec(base).then(async (first) => {
       if (!first.ok) {
         resolve(first);
@@ -712,11 +743,14 @@ function runNpmInstall(targetVersion) {
       const text = (first.log || []).join('\n');
       const allow = text.match(/--allow-scripts=([A-Za-z0-9@./_,-]+)/);
       if (!text.includes('allowScripts') || !allow) {
+        progress('更新完成', 100);
         resolve(first);
         return;
       }
       log(`allow-scripts 拦截检测到，用列表 ${allow[1]} 重装一次`);
+      progress('正在补装必要组件…', 92);
       const second = await exec([...base, `--allow-scripts=${allow[1]}`]);
+      progress('更新完成', 100);
       resolve(second.ok ? second : first);
     });
   });
@@ -762,7 +796,7 @@ async function startUpdate(targetVersion) {
   if (state.updating) return;
   state.updating = true;
   const progress = createUpdateWindow();
-  const result = await runNpmInstall(targetVersion);
+  const result = await runNpmInstall(targetVersion, (text, pct) => updateProgress(progress, text, pct));
   if (progress && !progress.isDestroyed()) progress.destroy();
   state.updating = false;
 
@@ -1050,8 +1084,12 @@ if (!gotLock) {
       const { installed, latest } = await runUpdateCheck();
       const target = latest || installed;
       const result = await new Promise((resolve) => {
-        const args = ['install', '-g', '--prefix', updateInstallTestPrefix, `${DSH_PACKAGE}@${target}`, '--no-audit', '--no-fund'];
-        const child = spawn('npm', args, { shell: true, env: process.env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+        const nodePath = findNode();
+        const bundledNpm = nodePath ? npmCliArgsFor(nodePath) : null;
+        const args = ['install', '-g', '--prefix', updateInstallTestPrefix, `${DSH_PACKAGE}@${target}`, '--no-audit', '--no-fund', '--registry=https://registry.npmmirror.com'];
+        const child = bundledNpm
+          ? spawn(bundledNpm[0], [...bundledNpm.slice(1), ...args], { env: process.env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
+          : spawn('npm', args, { shell: true, env: process.env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
         const out = [];
         const collect = (d) => {
           for (const line of String(d).replace(/\x1b\[[0-9;]*m/g, '').split(/\r?\n/)) {

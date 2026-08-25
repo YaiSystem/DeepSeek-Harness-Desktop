@@ -10,7 +10,7 @@
   "license": "MIT",
   "private": true,
   "scripts": {
-    "start": "electron .",
+    "start": "node scripts/start-clean.js",
     "icon": "node scripts/make-icon.js",
     "prepare": "node scripts/prepare-resources.js",
     "pack": "electron-builder --win --x64",
@@ -49,12 +49,6 @@
     "win": {
       "icon": "icon.ico",
       "target": [
-        {
-          "target": "portable",
-          "arch": [
-            "x64"
-          ]
-        },
         {
           "target": "nsis",
           "arch": [
