@@ -206,7 +206,7 @@ function bundledNodeDir() {
 }
 
 function bundledDshBinJs() {
-  return path.join(bundledBase(), 'dsh', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js');
+  return path.join(bundledBase(), 'dsh', 'bundle', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js');
 }
 
 // 给定 node.exe，返回其同目录自带的 npm 执行参数组（绿色版 Node 都自带 npm）

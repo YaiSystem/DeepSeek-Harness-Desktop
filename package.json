@@ -37,11 +37,17 @@
     "extraResources": [
       {
         "from": "resources/node",
-        "to": "node"
+        "to": "node",
+        "filter": [
+          "**/*"
+        ]
       },
       {
         "from": "resources/dsh",
-        "to": "dsh"
+        "to": "dsh",
+        "filter": [
+          "**/*"
+        ]
       }
     ],
     "asar": true,
