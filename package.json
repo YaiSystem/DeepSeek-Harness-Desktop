@@ -1,6 +1,6 @@
 {
   "name": "deepseek-harness-desktop",
-  "version": "1.1.0-20260904",
+  "version": "1.1.2-20260904",
   "description": "DeepSeek Harness 桌面应用 —— 双击启动 DSH Web 界面的原生窗口应用（黑鲸鱼图标）",
   "main": "src/main.js",
   "author": {

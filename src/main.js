@@ -37,9 +37,12 @@ const DSH_BOOT_MARKER = '__DSH_BOOT__';
 // 上游版本信息渠道：GitHub 仓库 deepseek-ai/deepseek-harness 通过 npm 发布，
 // 这里的检查与 GitHub 发布完全同步（DSH_UPDATE_URL 可覆盖，供测试）。
 const DSH_PACKAGE = '@deepseek-ai/dsh';
+const DESKTOP_REPOSITORY = 'YaiSystem/DeepSeek-Harness-Desktop';
 const UPDATE_URL = process.env.DSH_UPDATE_URL || `https://registry.npmjs.org/${DSH_PACKAGE}/latest`;
+const DESKTOP_UPDATE_URL = process.env.DSH_DESKTOP_UPDATE_URL || `https://api.github.com/repos/${DESKTOP_REPOSITORY}/releases/latest`;
 const UPDATE_FETCH_TIMEOUT_MS = 10_000;
 const UPDATE_INSTALL_TIMEOUT_MS = 10 * 60_000;
+const DESKTOP_DOWNLOAD_TIMEOUT_MS = 20 * 60_000;
 
 // ---------------------------------------------------------------- arguments
 
@@ -521,42 +524,14 @@ function compareVersions(a, b) {
   return 0;
 }
 
-function fetchLatestVersion() {
-  return new Promise((resolve) => {
-    const lib = UPDATE_URL.startsWith('http:') ? http : https;
-    const req = lib.get(
-      UPDATE_URL,
-      { timeout: UPDATE_FETCH_TIMEOUT_MS, headers: { accept: 'application/json' } },
-      (res) => {
-        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-          const lib2 = String(res.headers.location).startsWith('http:') ? http : https;
-          const req2 = lib2.get(res.headers.location, { timeout: UPDATE_FETCH_TIMEOUT_MS, headers: { accept: 'application/json' } }, (r2) => {
-            let body2 = '';
-            r2.on('data', (d) => { body2 += d; if (body2.length > 200_000) r2.destroy(); });
-            r2.on('end', () => { try { resolve(JSON.parse(body2).version || null); } catch { resolve(null); } });
-          });
-          req2.on('timeout', () => req2.destroy());
-          req2.on('error', () => resolve(null));
-          return;
-        }
-        let body = '';
-        res.on('data', (d) => {
-          body += d;
-          if (body.length > 200_000) req.destroy();
-        });
-        res.on('end', () => {
-          try {
-            resolve(JSON.parse(body).version || null);
-          } catch {
-            resolve(null);
-          }
-        });
-      }
-    );
-    req.on('timeout', () => req.destroy());
-    req.on('error', () => resolve(null));
-    req.end();
-  });
+async function fetchLatestVersion() {
+  try {
+    const data = await fetchJson(UPDATE_URL);
+    return typeof data.version === 'string' ? data.version : null;
+  } catch (error) {
+    log(`core update check failed: ${error.message}`);
+    return null;
+  }
 }
 
 function updateStatePath() {
@@ -577,13 +552,95 @@ function saveUpdateState(value) {
   } catch {}
 }
 
-/** 检查核心：已安装版本 + 上游最新版本。失败时相应字段为 null。 */
-async function runUpdateCheck() {
+function fetchJson(url) {
+  return new Promise((resolve, reject) => {
+    const lib = String(url).startsWith('http:') ? http : https;
+    const req = lib.get(url, {
+      timeout: UPDATE_FETCH_TIMEOUT_MS,
+      headers: { accept: 'application/json', 'user-agent': 'DeepSeek-Harness-Desktop' },
+    }, (res) => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        res.resume();
+        fetchJson(res.headers.location).then(resolve, reject);
+        return;
+      }
+      let body = '';
+      res.setEncoding('utf8');
+      res.on('data', (chunk) => {
+        body += chunk;
+        if (body.length > 1_000_000) req.destroy(new Error('response too large'));
+      });
+      res.on('end', () => {
+        if (res.statusCode !== 200) {
+          reject(new Error(`HTTP ${res.statusCode}`));
+          return;
+        }
+        try {
+          resolve(JSON.parse(body));
+        } catch (error) {
+          reject(error);
+        }
+      });
+    });
+    req.on('timeout', () => req.destroy(new Error('request timeout')));
+    req.on('error', reject);
+  });
+}
+
+function fetchLatestReleaseRedirect() {
+  return new Promise((resolve, reject) => {
+    const url = `https://github.com/${DESKTOP_REPOSITORY}/releases/latest`;
+    const req = https.get(url, {
+      timeout: UPDATE_FETCH_TIMEOUT_MS,
+      headers: { 'user-agent': 'DeepSeek-Harness-Desktop' },
+    }, (res) => {
+      const location = res.headers.location;
+      res.resume();
+      if (res.statusCode >= 300 && res.statusCode < 400 && location) resolve(location);
+      else reject(new Error(`GitHub latest release HTTP ${res.statusCode}`));
+    });
+    req.on('timeout', () => req.destroy(new Error('request timeout')));
+    req.on('error', reject);
+  });
+}
+
+async function fetchLatestDesktopRelease() {
+  try {
+    const release = await fetchJson(DESKTOP_UPDATE_URL);
+    const tag = typeof release.tag_name === 'string' ? release.tag_name.replace(/^v/i, '') : null;
+    const asset = Array.isArray(release.assets)
+      ? release.assets.find((item) => item.name && /setup\.exe$/i.test(item.name) && item.browser_download_url)
+      : null;
+    return { version: tag, name: release.name || tag, url: asset ? asset.browser_download_url : null, assetName: asset ? asset.name : null };
+  } catch (apiError) {
+    // API 受限或超时时，使用 GitHub releases/latest 的官方重定向作为备用通道。
+    const location = await fetchLatestReleaseRedirect();
+    const match = String(location).match(/\/releases\/tag\/v?([^/?#]+)$/i);
+    if (!match) throw apiError;
+    const version = decodeURIComponent(match[1]);
+    const assetName = `DeepSeek-Harness-${version}-setup.exe`;
+    return {
+      version,
+      name: `DeepSeek Harness Desktop ${version}`,
+      url: `https://github.com/${DESKTOP_REPOSITORY}/releases/download/v${version}/${assetName}`,
+      assetName,
+    };
+  }
+}
+
+/** 统一检查 DSH 核心和桌面端 GitHub Release。 */
+async function runUnifiedUpdateCheck() {
   const binJs = findDshBinJs();
-  const installed = binJs ? readDshVersion(binJs) : null;
-  const latest = await fetchLatestVersion();
-  log(`update check: installed=${installed} latest=${latest}`);
-  return { installed, latest };
+  const installedCore = binJs ? readDshVersion(binJs) : null;
+  const [latestCore, desktop] = await Promise.all([
+    fetchLatestVersion().catch((error) => { log(`core update check failed: ${error.message}`); return null; }),
+    fetchLatestDesktopRelease().catch((error) => { log(`desktop update check failed: ${error.message}`); return null; }),
+  ]);
+  const installedDesktop = app.getVersion();
+  const coreAvailable = !!(installedCore && latestCore && compareVersions(latestCore, installedCore) > 0);
+  const desktopAvailable = !!(desktop && desktop.version && desktop.url && compareVersions(desktop.version, installedDesktop) > 0);
+  log(`unified update check: core ${installedCore} -> ${latestCore}; desktop ${installedDesktop} -> ${desktop && desktop.version}`);
+  return { installedCore, latestCore, desktop, installedDesktop, coreAvailable, desktopAvailable };
 }
 
 function scheduleAutoUpdateCheck() {
@@ -592,33 +649,38 @@ function scheduleAutoUpdateCheck() {
   setTimeout(async () => {
     if (state.quitting || state.smokeFinished || state.updating) return;
     try {
-      const { installed, latest } = await runUpdateCheck();
-      if (!installed || !latest) return; // 拿不到信息时不打扰用户
-      if (compareVersions(latest, installed) <= 0) return;
-      if (loadUpdateState().skipped === latest) return; // 用户已跳过该版本
-      promptUpdate(installed, latest);
-    } catch (err) {
-      log(`auto update check failed: ${err && err.message}`);
+      const result = await runUnifiedUpdateCheck();
+      if (!result.coreAvailable && !result.desktopAvailable) return;
+      const stateFile = loadUpdateState();
+      const coreSkipped = result.coreAvailable && stateFile.skippedCore === result.latestCore;
+      const desktopSkipped = result.desktopAvailable && stateFile.skippedDesktop === result.desktop.version;
+      if ((!result.coreAvailable || coreSkipped) && (!result.desktopAvailable || desktopSkipped)) return;
+      promptUnifiedUpdate(result);
+    } catch (error) {
+      log(`auto unified update check failed: ${error.message}`);
     }
   }, 2_500);
 }
 
-function promptUpdate(installed, latest) {
-  dialog
-    .showMessageBox({
-      type: 'info',
-      title: APP_NAME,
-      message: `发现新版本 ${latest}`,
-      detail: `当前安装的 DeepSeek Harness 核心版本为 ${installed}。\n上游（GitHub deepseek-ai/deepseek-harness 的 npm 发布）已有新版本 ${latest}，建议更新。`,
-      buttons: ['立即更新', '稍后提醒', `跳过 ${latest}`],
-      defaultId: 0,
-      cancelId: 1,
-    })
-    .then(({ response }) => {
-      if (response === 0) startUpdate(latest);
-      else if (response === 2) saveUpdateState({ skipped: latest });
-    })
-    .catch(() => {});
+function promptUnifiedUpdate(result) {
+  const lines = [];
+  if (result.coreAvailable) lines.push(`DeepSeek Harness 核心：${result.installedCore} → ${result.latestCore}`);
+  if (result.desktopAvailable) lines.push(`桌面应用：${result.installedDesktop} → ${result.desktop.version}`);
+  dialog.showMessageBox({
+    type: 'info',
+    title: APP_NAME,
+    message: '发现可用更新',
+    detail: `${lines.join('\n')}\n\n点击“立即更新”后，应用会自动处理对应更新。`,
+    buttons: ['立即更新', '稍后提醒', '跳过本次版本'],
+    defaultId: 0,
+    cancelId: 1,
+  }).then(({ response }) => {
+    if (response === 0) startUnifiedUpdate(result);
+    else if (response === 2) saveUpdateState({
+      skippedCore: result.coreAvailable ? result.latestCore : loadUpdateState().skippedCore,
+      skippedDesktop: result.desktopAvailable ? result.desktop.version : loadUpdateState().skippedDesktop,
+    });
+  }).catch(() => {});
 }
 
 function createUpdateWindow() {
@@ -792,54 +854,93 @@ async function restartOwnServer() {
   log(`server restarted with updated dsh at ${state.url}`);
 }
 
-async function startUpdate(targetVersion) {
+function downloadFile(url, destination, onProgress) {
+  return new Promise((resolve, reject) => {
+    const lib = String(url).startsWith('http:') ? http : https;
+    const output = fs.createWriteStream(destination);
+    const request = lib.get(url, {
+      timeout: UPDATE_FETCH_TIMEOUT_MS,
+      headers: { 'user-agent': 'DeepSeek-Harness-Desktop' },
+    }, (response) => {
+      if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
+        output.close();
+        try { fs.unlinkSync(destination); } catch {}
+        downloadFile(response.headers.location, destination, onProgress).then(resolve, reject);
+        return;
+      }
+      if (response.statusCode !== 200) {
+        response.resume();
+        output.close();
+        reject(new Error(`下载更新包失败：HTTP ${response.statusCode}`));
+        return;
+      }
+      const total = Number(response.headers['content-length']) || 0;
+      let received = 0;
+      response.on('data', (chunk) => {
+        received += chunk.length;
+        onProgress(received, total);
+      });
+      response.on('error', reject);
+      output.on('finish', () => output.close(() => resolve()));
+      response.pipe(output);
+    });
+    request.setTimeout(DESKTOP_DOWNLOAD_TIMEOUT_MS, () => request.destroy(new Error('下载更新包超时')));
+    request.on('error', (error) => {
+      try { output.close(); } catch {}
+      try { fs.unlinkSync(destination); } catch {}
+      reject(error);
+    });
+  });
+}
+
+async function startUnifiedUpdate(result) {
   if (state.updating) return;
   state.updating = true;
   const progress = createUpdateWindow();
-  const result = await runNpmInstall(targetVersion, (text, pct) => updateProgress(progress, text, pct));
-  if (progress && !progress.isDestroyed()) progress.destroy();
-  state.updating = false;
-
-  if (result.ok) {
-    const binJs = findDshBinJs();
-    const nowVer = binJs ? readDshVersion(binJs) : null;
-    log(`update finished, version now: ${nowVer}`);
-    if (state.child && !state.attached) {
-      try {
-        await restartOwnServer();
-        dialog.showMessageBox({
-          type: 'info',
-          title: APP_NAME,
-          message: '更新完成',
-          detail: `DeepSeek Harness 核心已更新到 ${nowVer || targetVersion}，本地服务已自动重启，立即生效。`,
-          buttons: ['好'],
-        });
-      } catch (err) {
-        dialog.showMessageBox({
-          type: 'warning',
-          title: APP_NAME,
-          message: '更新完成，但服务重启失败',
-          detail: `核心已更新到 ${nowVer || targetVersion}。\n重启服务失败：${err.message}\n请关闭应用后重新打开。`,
-          buttons: ['好'],
-        });
-      }
-    } else {
-      dialog.showMessageBox({
-        type: 'info',
-        title: APP_NAME,
-        message: '更新完成',
-        detail: `DeepSeek Harness 核心已更新到 ${nowVer || targetVersion}。\n当前连接的是已经运行中的服务，重启该服务后生效。`,
-        buttons: ['好'],
-      });
+  try {
+    if (result.coreAvailable) {
+      const coreResult = await runNpmInstall(result.latestCore, (text, pct) => updateProgress(progress, `核心更新：${text}`, pct));
+      if (!coreResult.ok) throw new Error((coreResult.log && coreResult.log.slice(-12).join('\\n')) || coreResult.error || '核心更新失败');
     }
-  } else {
-    dialog.showMessageBox({
-      type: 'error',
-      title: APP_NAME,
-      message: '更新失败',
-      detail: (result.log && result.log.slice(-12).join('\n')) || result.error || '未知错误',
-      buttons: ['好'],
-    });
+
+    if (result.desktopAvailable) {
+      const downloadPath = path.join(app.getPath('userData'), `DeepSeek-Harness-${result.desktop.version}-setup.exe`);
+      await downloadFile(result.desktop.url, downloadPath, (received, total) => {
+        if (total > 0) {
+          const pct = Math.min(99, Math.round((received / total) * 100));
+          updateProgress(progress, `正在下载桌面应用更新包（${Math.round(received / 1024 / 1024)} / ${Math.round(total / 1024 / 1024)} MB）…`, pct);
+        } else {
+          updateProgress(progress, `正在下载桌面应用更新包（${Math.round(received / 1024 / 1024)} MB）…`, null);
+        }
+      });
+      updateProgress(progress, '下载完成，正在启动安装程序…', 100);
+      setTimeout(() => {
+        if (progress && !progress.isDestroyed()) progress.destroy();
+        state.quitting = true;
+        killChildTree();
+        app.once('quit', () => {
+          const installer = spawn(downloadPath, ['/S'], { detached: true, stdio: 'ignore', windowsHide: true });
+          installer.unref();
+        });
+        app.quit();
+      }, 350);
+      return;
+    }
+
+    if (progress && !progress.isDestroyed()) progress.destroy();
+    state.updating = false;
+    const binJs = findDshBinJs();
+    const nowVer = binJs ? readDshVersion(binJs) : result.latestCore;
+    if (state.child && !state.attached) {
+      await restartOwnServer();
+      await dialog.showMessageBox({ type: 'info', title: APP_NAME, message: '更新完成', detail: `DeepSeek Harness 核心已更新到 ${nowVer}，服务已自动重启。`, buttons: ['好'] });
+    } else {
+      await dialog.showMessageBox({ type: 'info', title: APP_NAME, message: '更新完成', detail: `DeepSeek Harness 核心已更新到 ${nowVer}。重启服务后生效。`, buttons: ['好'] });
+    }
+  } catch (error) {
+    if (progress && !progress.isDestroyed()) progress.destroy();
+    state.updating = false;
+    await dialog.showMessageBox({ type: 'error', title: APP_NAME, message: '更新失败', detail: error.message || String(error), buttons: ['好'] });
   }
 }
 
@@ -992,43 +1093,24 @@ function installMenu() {
         {
           label: '检查更新',
           click: async () => {
+            if (state.updating) return;
             try {
-              const { installed, latest } = await runUpdateCheck();
-              if (!installed) {
-                dialog.showMessageBox({
-                  type: 'warning',
-                  title: APP_NAME,
-                  message: '未检测到已安装的 DeepSeek Harness 核心',
-                  detail: '请先通过 npm 安装：npm install -g @deepseek-ai/dsh',
-                  buttons: ['好'],
-                });
-              } else if (!latest) {
-                dialog.showMessageBox({
-                  type: 'warning',
-                  title: APP_NAME,
-                  message: '无法连接更新服务器',
-                  detail: '请检查网络后重试。',
-                  buttons: ['好'],
-                });
-              } else if (compareVersions(latest, installed) <= 0) {
-                dialog.showMessageBox({
+              const result = await runUnifiedUpdateCheck();
+              if (!result.coreAvailable && !result.desktopAvailable) {
+                const core = result.latestCore || '无法获取';
+                const desktop = result.desktop && result.desktop.version ? result.desktop.version : '无法获取';
+                await dialog.showMessageBox({
                   type: 'info',
                   title: APP_NAME,
-                  message: `已是最新版本（${installed}）`,
-                  detail: '与上游 GitHub（npm 发布）保持同步。',
+                  message: '已是最新版本',
+                  detail: `核心版本：${result.installedCore || '未检测到'}（上游：${core}）\n桌面版本：${result.installedDesktop}（GitHub：${desktop}）`,
                   buttons: ['好'],
                 });
-              } else {
-                promptUpdate(installed, latest);
+                return;
               }
-            } catch (err) {
-              dialog.showMessageBox({
-                type: 'error',
-                title: APP_NAME,
-                message: '检查更新失败',
-                detail: (err && err.message) || String(err),
-                buttons: ['好'],
-              });
+              promptUnifiedUpdate(result);
+            } catch (error) {
+              await dialog.showMessageBox({ type: 'error', title: APP_NAME, message: '检查更新失败', detail: error.message || String(error), buttons: ['好'] });
             }
           },
         },
@@ -1081,8 +1163,8 @@ if (!gotLock) {
 
     // 测试钩子 2：把最新版安装到临时 prefix（不触碰全局安装），验证更新命令可行
     if (updateInstallTestPrefix) {
-      const { installed, latest } = await runUpdateCheck();
-      const target = latest || installed;
+      const { installedCore, latestCore } = await runUnifiedUpdateCheck();
+      const target = latestCore || installedCore;
       const result = await new Promise((resolve) => {
         const nodePath = findNode();
         const bundledNpm = nodePath ? npmCliArgsFor(nodePath) : null;
@@ -1103,24 +1185,26 @@ if (!gotLock) {
       });
       fs.writeFileSync(
         updateCheckTestPath || path.join(os.tmpdir(), 'dsh-update-install-test.json'),
-        JSON.stringify({ installed, latest, target, installOk: result.ok, code: result.code, error: result.error, logTail: result.logTail }, null, 2),
+        JSON.stringify({ installedCore, latestCore, target, installOk: result.ok, code: result.code, error: result.error, logTail: result.logTail }, null, 2),
         'utf8'
       );
       app.exit(result.ok ? 0 : 1);
       return;
     }
 
-    // 测试钩子 1：只跑更新检查并输出决策，不弹窗、不建窗口
+    // 测试钩子 1：同时检查核心与桌面端并输出决策，不弹窗、不建窗口
     if (updateCheckTestPath) {
-      const { installed, latest } = await runUpdateCheck();
-      const action = !installed
-        ? 'no-dsh'
-        : !latest
-          ? 'no-network'
-          : compareVersions(latest, installed) > 0
-            ? 'update-available'
-            : 'up-to-date';
-      fs.writeFileSync(updateCheckTestPath, JSON.stringify({ installed, latest, action }, null, 2), 'utf8');
+      const result = await runUnifiedUpdateCheck();
+      const action = result.coreAvailable || result.desktopAvailable ? 'update-available' : 'up-to-date';
+      fs.writeFileSync(updateCheckTestPath, JSON.stringify({
+        installedCore: result.installedCore,
+        latestCore: result.latestCore,
+        installedDesktop: result.installedDesktop,
+        latestDesktop: result.desktop && result.desktop.version,
+        coreAvailable: result.coreAvailable,
+        desktopAvailable: result.desktopAvailable,
+        action,
+      }, null, 2), 'utf8');
       app.exit(0);
       return;
     }
