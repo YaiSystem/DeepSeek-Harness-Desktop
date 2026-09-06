@@ -1019,30 +1019,6 @@ function isAppUrl(url) {
   }
 }
 
-function injectInPageUpdateButton(win) {
-  if (!win || win.isDestroyed()) return;
-  const script = `(function() {
-    if (document.getElementById('dsh-floating-update-btn')) return;
-    try {
-      var btn = document.createElement('button');
-      btn.id = 'dsh-floating-update-btn';
-      btn.setAttribute('type', 'button');
-      btn.setAttribute('title', '检查更新（同时检查 DSH 核心与桌面应用版本）');
-      btn.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="margin-right:5px;flex-shrink:0"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg><span>检查更新</span>';
-      btn.style.cssText = 'position:fixed;top:10px;right:20px;z-index:999999;display:inline-flex;align-items:center;padding:5px 12px;font-size:12px;font-weight:500;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:#d0d4dc;background:rgba(18,18,26,0.88);border:1px solid rgba(255,255,255,0.14);border-radius:16px;cursor:pointer;backdrop-filter:blur(8px);box-shadow:0 2px 10px rgba(0,0,0,0.35);transition:all .18s ease;user-select:none;line-height:1.2;';
-      btn.onmouseenter = function() { btn.style.color='#ffffff'; btn.style.background='rgba(35,35,48,0.96)'; btn.style.borderColor='rgba(255,255,255,0.28)'; btn.style.transform='translateY(-1px)'; };
-      btn.onmouseleave = function() { btn.style.color='#d0d4dc'; btn.style.background='rgba(18,18,26,0.88)'; btn.style.borderColor='rgba(255,255,255,0.14)'; btn.style.transform='translateY(0)'; };
-      btn.onclick = function(e) {
-        e.preventDefault();
-        e.stopPropagation();
-        console.log('__DSH_TRIGGER_CHECK_UPDATE__');
-      };
-      document.body.appendChild(btn);
-    } catch(err) {}
-  })()`;
-  win.webContents.executeJavaScript(script).catch(() => {});
-}
-
 function createMainWindow() {
   const win = new BrowserWindow({
     width: 1440,
@@ -1098,18 +1074,8 @@ function createMainWindow() {
     const rawLevel = (event && typeof event.level === 'string') ? event.level : (typeof level === 'string' ? level : '');
     const rawSource = (event && typeof event.sourceId === 'string') ? event.sourceId : (typeof sourceId === 'string' ? sourceId : '');
     const rawLine = (event && typeof event.lineNumber === 'number') ? event.lineNumber : (typeof line === 'number' ? line : 0);
-    if (rawMsg === '__DSH_TRIGGER_CHECK_UPDATE__') {
-      triggerManualUpdateCheck();
-      return;
-    }
     if (rawLevel === 'error' || rawLevel === 'warning' || process.env.DSH_VERBOSE_CONSOLE) {
       log(`[renderer:${rawLevel === 'error' ? 'error' : rawLevel === 'warning' ? 'warn' : 'log'}] ${rawMsg} @ ${rawSource}:${rawLine}`);
-    }
-  });
-
-  win.webContents.on('did-finish-load', () => {
-    if (!win.isDestroyed() && isAppUrl(win.webContents.getURL())) {
-      injectInPageUpdateButton(win);
     }
   });
 
