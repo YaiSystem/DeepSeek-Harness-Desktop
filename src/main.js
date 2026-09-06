@@ -17,7 +17,7 @@
  *   --port <n>          override the port (default: DSH_PORT env or 3080)
  */
 
-const { app, BrowserWindow, Menu, dialog, shell } = require('electron');
+const { app, BrowserWindow, Menu, dialog, shell, session } = require('electron');
 const { spawn, spawnSync } = require('node:child_process');
 const http = require('node:http');
 const https = require('node:https');
@@ -73,7 +73,20 @@ const state = {
   bootError: null,
   updating: false,
   updateChecked: false,
+  // dsh 0.1.2+ 的服务会带一次性访问令牌（URL 形如 http://127.0.0.1:3080/?token=xxx），
+  // 无令牌访问会返回 401，因此必须从子进程输出里把它抓下来用于探测和加载页面。
+  token: null,
 };
+
+// 服务根路径：带令牌（新版）或裸根路径（旧版，无认证）
+function rootPath() {
+  return state.token ? `/?token=${encodeURIComponent(state.token)}` : '/';
+}
+
+// 完整访问地址（主窗口加载、外部浏览器打开都用这个）
+function urlFor(port) {
+  return `http://127.0.0.1:${port}${rootPath()}`;
+}
 
 // 测试/隔离用：指定独立 userData 目录，避免与正在使用的实例抢单实例锁
 const userDataDirArg = getArg('--user-data-dir');
@@ -116,6 +129,12 @@ function log(...args) {
 function childLogLine(line) {
   const clean = String(line).replace(/\x1b\[[0-9;]*m/g, '').trimEnd();
   if (!clean) return;
+  // 抓取服务启动时打印的访问令牌：dsh web: http://127.0.0.1:3080/?token=xxx
+  const m = clean.match(/[?&]token=([A-Za-z0-9_\-]+)/);
+  if (m && m[1] !== state.token) {
+    state.token = m[1];
+    log('captured dsh access token');
+  }
   state.childLog.push(clean);
   if (state.childLog.length > 150) state.childLog.shift();
   log(`[dsh] ${clean}`);
@@ -273,10 +292,30 @@ function findDshBinJs() {
   return null;
 }
 
-function httpProbe(port, cb) {
+function httpProbe(port, cb, pathname, redirects = 0, cookie = '') {
+  // dsh 0.1.2+ 的真实握手：GET /?token=xxx → 303 → 带上服务端下发的 cookie → 200 页面。
+  // 因此探测必须跟随重定向并回传 cookie，否则永远读不到带 __DSH_BOOT__ 的正文。
+  const headers = cookie ? { cookie } : {};
   const req = http.request(
-    { host: '127.0.0.1', port, path: '/', method: 'GET', timeout: PROBE_TIMEOUT_MS },
+    { host: '127.0.0.1', port, path: pathname || '/', method: 'GET', timeout: PROBE_TIMEOUT_MS, headers },
     (res) => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location && redirects < 5) {
+        const location = String(res.headers.location);
+        const setCookie = res.headers['set-cookie'];
+        const nextCookie = setCookie
+          ? setCookie.map((c) => String(c).split(';')[0]).join('; ')
+          : cookie;
+        let nextPath = location;
+        if (/^https?:\/\//i.test(location)) {
+          try {
+            const u = new URL(location);
+            nextPath = u.pathname + (u.search || '');
+          } catch {}
+        }
+        res.resume(); // 丢弃重定向响应体，避免连接挂住
+        httpProbe(port, cb, nextPath, redirects + 1, nextCookie);
+        return;
+      }
       let body = '';
       res.on('data', (d) => {
         body += d;
@@ -332,7 +371,7 @@ function waitForDsh(port) {
           clearInterval(timer);
           reject(new Error(`等待服务就绪超时（${READY_TIMEOUT_MS / 1000}s）`));
         }
-      });
+      }, rootPath()); // 带上访问令牌，否则新版 dsh 一律返回 401
     }, POLL_INTERVAL_MS);
     timer.unref();
   });
@@ -472,8 +511,10 @@ async function bootServer() {
   // 4. spawn and wait for readiness
   state.child = await startServer(nodePath, binJs, spawnPort);
   state.port = spawnPort;
-  state.url = `http://127.0.0.1:${spawnPort}/`;
+  state.url = urlFor(spawnPort);
   await waitForDsh(spawnPort);
+  // 服务就绪时令牌已抓到，刷新为带令牌的地址
+  state.url = urlFor(spawnPort);
   state.ready = true;
   log(`server ready at ${state.url}`);
 }
@@ -664,13 +705,13 @@ function scheduleAutoUpdateCheck() {
 
 function promptUnifiedUpdate(result) {
   const lines = [];
-  if (result.coreAvailable) lines.push(`DeepSeek Harness 核心：${result.installedCore} → ${result.latestCore}`);
-  if (result.desktopAvailable) lines.push(`桌面应用：${result.installedDesktop} → ${result.desktop.version}`);
+  if (result.coreAvailable) lines.push(`• DeepSeek Harness 核心：${result.installedCore} → ${result.latestCore}`);
+  if (result.desktopAvailable) lines.push(`• 桌面应用软件：${result.installedDesktop} → ${result.desktop.version}`);
   dialog.showMessageBox({
     type: 'info',
     title: APP_NAME,
     message: '发现可用更新',
-    detail: `${lines.join('\n')}\n\n点击“立即更新”后，应用会自动处理对应更新。`,
+    detail: `${lines.join('\n')}\n\n点击“立即更新”即可自动更新对应内容（哪个有更新就更新哪个）。`,
     buttons: ['立即更新', '稍后提醒', '跳过本次版本'],
     defaultId: 0,
     cancelId: 1,
@@ -843,12 +884,14 @@ async function restartOwnServer() {
   state.childKilled = false;
   state.ready = false;
   state.childLog = [];
+  state.token = null; // 新进程会签发新令牌，旧令牌作废
   await waitPortFree(port);
   const binJs = findDshBinJs();
   const nodePath = findNode();
   if (!binJs || !nodePath) throw new Error('更新后未找到 dsh CLI 或 Node.js');
   state.child = await startServer(nodePath, binJs, port);
   await waitForDsh(port);
+  state.url = urlFor(port); // 重启后令牌已更新
   state.ready = true;
   if (state.mainWindow && !state.mainWindow.isDestroyed()) state.mainWindow.loadURL(state.url);
   log(`server restarted with updated dsh at ${state.url}`);
@@ -964,9 +1007,40 @@ function createSplash() {
 }
 
 function isAppUrl(url) {
-  if (!state.url) return false;
-  const base = state.url.replace(/\/$/, '');
-  return url === state.url || url.startsWith(base + '/') || url.startsWith(base + '#') || url.startsWith(base + '?');
+  // 按「本机 + 同一个端口」判定，而不是比对 URL 前缀：新版 dsh 的地址带一次性
+  // token 参数，页面内跳转可能丢掉该参数，前缀匹配会误伤并拦截正常导航。
+  if (!state.port) return false;
+  try {
+    const u = new URL(url);
+    const host = u.hostname;
+    return (host === '127.0.0.1' || host === 'localhost') && Number(u.port || 0) === Number(state.port);
+  } catch {
+    return false;
+  }
+}
+
+function injectInPageUpdateButton(win) {
+  if (!win || win.isDestroyed()) return;
+  const script = `(function() {
+    if (document.getElementById('dsh-floating-update-btn')) return;
+    try {
+      var btn = document.createElement('button');
+      btn.id = 'dsh-floating-update-btn';
+      btn.setAttribute('type', 'button');
+      btn.setAttribute('title', '检查更新（同时检查 DSH 核心与桌面应用版本）');
+      btn.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="margin-right:5px;flex-shrink:0"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg><span>检查更新</span>';
+      btn.style.cssText = 'position:fixed;top:10px;right:20px;z-index:999999;display:inline-flex;align-items:center;padding:5px 12px;font-size:12px;font-weight:500;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:#d0d4dc;background:rgba(18,18,26,0.88);border:1px solid rgba(255,255,255,0.14);border-radius:16px;cursor:pointer;backdrop-filter:blur(8px);box-shadow:0 2px 10px rgba(0,0,0,0.35);transition:all .18s ease;user-select:none;line-height:1.2;';
+      btn.onmouseenter = function() { btn.style.color='#ffffff'; btn.style.background='rgba(35,35,48,0.96)'; btn.style.borderColor='rgba(255,255,255,0.28)'; btn.style.transform='translateY(-1px)'; };
+      btn.onmouseleave = function() { btn.style.color='#d0d4dc'; btn.style.background='rgba(18,18,26,0.88)'; btn.style.borderColor='rgba(255,255,255,0.14)'; btn.style.transform='translateY(0)'; };
+      btn.onclick = function(e) {
+        e.preventDefault();
+        e.stopPropagation();
+        console.log('__DSH_TRIGGER_CHECK_UPDATE__');
+      };
+      document.body.appendChild(btn);
+    } catch(err) {}
+  })()`;
+  win.webContents.executeJavaScript(script).catch(() => {});
 }
 
 function createMainWindow() {
@@ -977,7 +1051,7 @@ function createMainWindow() {
     minHeight: 640,
     show: false,
     backgroundColor: '#0b0b10',
-    autoHideMenuBar: true,
+    autoHideMenuBar: false,
     title: APP_NAME,
     icon: path.join(__dirname, '..', 'build', 'icon.png'),
     webPreferences: {
@@ -1005,8 +1079,46 @@ function createMainWindow() {
     }
   });
 
+  // 前端用 fetch/XHR 拉模块，这类失败既不触发 did-fail-load 也不进 console，
+  // 只能在网络层看得到 —— "页面一直转圈"往往就是卡在这。
+  if (process.env.DSH_NET_DEBUG) {
+    const filter = { urls: ['*://127.0.0.1/*', '*://localhost/*'] };
+    session.defaultSession.webRequest.onErrorOccurred(filter, (d) => {
+      log(`[net] FAILED ${d.error} ${d.method} ${d.url}`);
+    });
+    session.defaultSession.webRequest.onCompleted(filter, (d) => {
+      if (d.statusCode >= 400) log(`[net] HTTP ${d.statusCode} ${d.method} ${d.url}`);
+    });
+  }
+
+  // 页面内部（脚本/接口）失败不会触发 did-fail-load，只会在渲染进程里打日志；
+  // 没有这条就完全看不到"白屏/一直转圈"的真实原因。
+  win.webContents.on('console-message', (event, level, message, line, sourceId) => {
+    const rawMsg = (event && typeof event.message === 'string') ? event.message : (typeof message === 'string' ? message : '');
+    const rawLevel = (event && typeof event.level === 'string') ? event.level : (typeof level === 'string' ? level : '');
+    const rawSource = (event && typeof event.sourceId === 'string') ? event.sourceId : (typeof sourceId === 'string' ? sourceId : '');
+    const rawLine = (event && typeof event.lineNumber === 'number') ? event.lineNumber : (typeof line === 'number' ? line : 0);
+    if (rawMsg === '__DSH_TRIGGER_CHECK_UPDATE__') {
+      triggerManualUpdateCheck();
+      return;
+    }
+    if (rawLevel === 'error' || rawLevel === 'warning' || process.env.DSH_VERBOSE_CONSOLE) {
+      log(`[renderer:${rawLevel === 'error' ? 'error' : rawLevel === 'warning' ? 'warn' : 'log'}] ${rawMsg} @ ${rawSource}:${rawLine}`);
+    }
+  });
+
+  win.webContents.on('did-finish-load', () => {
+    if (!win.isDestroyed() && isAppUrl(win.webContents.getURL())) {
+      injectInPageUpdateButton(win);
+    }
+  });
+
   win.webContents.on('did-fail-load', (event, errorCode, errorDescription, validatedURL, isMainFrame) => {
-    if (!isMainFrame || state.smokeFinished) return;
+    if (!isMainFrame) {
+      log(`[subresource] failed to load ${validatedURL} (${errorCode} ${errorDescription})`);
+      return;
+    }
+    if (state.smokeFinished) return;
     if (state.loadFailures < LOAD_RETRY_MAX && !state.quitting) {
       state.loadFailures += 1;
       log(`load failed (${errorCode} ${errorDescription}), retry ${state.loadFailures}`);
@@ -1092,27 +1204,7 @@ function installMenu() {
       submenu: [
         {
           label: '检查更新',
-          click: async () => {
-            if (state.updating) return;
-            try {
-              const result = await runUnifiedUpdateCheck();
-              if (!result.coreAvailable && !result.desktopAvailable) {
-                const core = result.latestCore || '无法获取';
-                const desktop = result.desktop && result.desktop.version ? result.desktop.version : '无法获取';
-                await dialog.showMessageBox({
-                  type: 'info',
-                  title: APP_NAME,
-                  message: '已是最新版本',
-                  detail: `核心版本：${result.installedCore || '未检测到'}（上游：${core}）\n桌面版本：${result.installedDesktop}（GitHub：${desktop}）`,
-                  buttons: ['好'],
-                });
-                return;
-              }
-              promptUnifiedUpdate(result);
-            } catch (error) {
-              await dialog.showMessageBox({ type: 'error', title: APP_NAME, message: '检查更新失败', detail: error.message || String(error), buttons: ['好'] });
-            }
-          },
+          click: triggerManualUpdateCheck,
         },
         {
           label: '在浏览器中打开',
@@ -1131,15 +1223,47 @@ function installMenu() {
               type: 'info',
               title: `关于 ${APP_NAME}`,
               message: APP_NAME,
-              detail: `双击启动的 DeepSeek Harness 桌面应用\n外壳版本 ${app.getVersion()}\n核心版本 ${dshVer}\n服务地址：${state.url || '—'}\n\n更新说明：核心与 GitHub deepseek-ai/deepseek-harness\n的 npm 发布保持同步，可在「帮助 → 检查更新」手动检查。`,
+              detail: `双击启动的 DeepSeek Harness 桌面应用\n桌面应用版本 ${app.getVersion()}\nDSH 核心版本 ${dshVer}\n服务地址：${state.url || '—'}\n\n更新说明：启动时自动检查，也可随时点击菜单栏「🔄 检查更新」或界面右上角按钮进行统一检查。`,
               buttons: ['好'],
             });
           },
         },
       ],
     },
+    {
+      label: '🔄 检查更新',
+      click: triggerManualUpdateCheck,
+    },
   ];
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
+}
+
+async function triggerManualUpdateCheck() {
+  if (state.updating) return;
+  try {
+    const result = await runUnifiedUpdateCheck();
+    if (!result.coreAvailable && !result.desktopAvailable) {
+      const core = result.latestCore || '无法获取';
+      const desktop = result.desktop && result.desktop.version ? result.desktop.version : '无法获取';
+      await dialog.showMessageBox({
+        type: 'info',
+        title: APP_NAME,
+        message: '已是最新版本',
+        detail: `• DSH 核心版本：${result.installedCore || '未检测到'}（npm 上游：${core}）\n• 桌面应用版本：${result.installedDesktop}（GitHub 最新：${desktop}）`,
+        buttons: ['好'],
+      });
+      return;
+    }
+    promptUnifiedUpdate(result);
+  } catch (error) {
+    await dialog.showMessageBox({
+      type: 'error',
+      title: APP_NAME,
+      message: '检查更新失败',
+      detail: error.message || String(error),
+      buttons: ['好'],
+    });
+  }
 }
 
 // ---------------------------------------------------------------- app lifecycle
