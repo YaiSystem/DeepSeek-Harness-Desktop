@@ -231,6 +231,54 @@ function bundledDshBinJs() {
   return path.join(bundledBase(), 'dsh', 'bundle', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js');
 }
 
+function bundledDshTarPath() {
+  return path.join(bundledBase(), 'dsh', 'dsh-core.tar');
+}
+
+function updateSplashStatus(text) {
+  if (!state.splash || state.splash.isDestroyed()) return;
+  const script = `(function() {
+    var s = document.getElementById('status-text');
+    if (s) s.textContent = ${JSON.stringify(String(text || ''))};
+  })()`;
+  state.splash.webContents.executeJavaScript(script).catch(() => {});
+}
+
+async function ensureBundledDshExtracted(onStatus) {
+  const binJs = bundledDshBinJs();
+  if (existingFile(binJs)) return binJs;
+
+  const tarPath = bundledDshTarPath();
+  if (!existingFile(tarPath)) return null;
+
+  const dshDir = path.join(bundledBase(), 'dsh');
+  log(`extracting ${tarPath} to ${dshDir}...`);
+  if (onStatus) onStatus('正在初始化核心运行环境（首次启动需约十秒）…');
+
+  await new Promise((resolve, reject) => {
+    const tarExe = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'tar.exe');
+    const child = spawn(tarExe, ['-xf', tarPath, '-C', dshDir], {
+      windowsHide: true,
+      stdio: 'ignore',
+    });
+    child.on('error', (err) => {
+      log(`tar.exe error: ${err.message}`);
+      reject(err);
+    });
+    child.on('exit', (code) => {
+      if (code === 0) {
+        log(`dsh core extracted successfully to ${dshDir}`);
+        resolve();
+      } else {
+        reject(new Error(`解压核心环境失败，退出码 ${code}`));
+      }
+    });
+  });
+
+  if (onStatus) onStatus('正在启动服务…');
+  return existingFile(binJs);
+}
+
 // 给定 node.exe，返回其同目录自带的 npm 执行参数组（绿色版 Node 都自带 npm）
 function npmCliArgsFor(nodePath) {
   const npmCli = path.join(path.dirname(nodePath), 'node_modules', 'npm', 'bin', 'npm-cli.js');
@@ -495,7 +543,12 @@ async function bootServer() {
   }
 
   // 3. locate the CLI
-  const binJs = findDshBinJs();
+  let binJs = findDshBinJs();
+  if (!binJs) {
+    // 首次启动且无全局环境时，自动解压内置的核心归档
+    await ensureBundledDshExtracted((msg) => updateSplashStatus(msg));
+    binJs = findDshBinJs();
+  }
   if (!binJs) {
     throw new Error(
       '未找到 DeepSeek Harness 命令行工具 (dsh)。\n\n请先安装：\n  npm install -g @deepseek-ai/dsh\n\n或设置环境变量 DSH_CLI 指向 dsh 的 lib/bin.js。'

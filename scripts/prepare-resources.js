@@ -14,7 +14,7 @@ const ROOT = path.join(__dirname, '..');
 const NODE_VERSION = 'v24.19.0';
 const NODE_DIR_NAME = `node-${NODE_VERSION}-win-x64`;
 const DSH_PACKAGE = '@deepseek-ai/dsh';
-const DSH_VERSION = '0.1.0-rc.6';
+const DSH_VERSION = '0.1.1-rc.2';
 const RESOURCES = path.join(ROOT, 'resources');
 
 const MIRROR = process.env.NODE_DOWNLOAD_MIRROR || 'https://npmmirror.com/mirrors/node';
@@ -31,7 +31,7 @@ function run(cmd, args, opts) {
 function main() {
   fs.mkdirSync(RESOURCES, { recursive: true });
 
-  // 1. 内置 Node 绿色版（Windows 自带 curl.exe 下载，PowerShell 解压）
+  // 1. 内置 Node 绿色版
   const nodeDir = path.join(RESOURCES, 'node', NODE_DIR_NAME);
   const nodeExe = path.join(nodeDir, 'node.exe');
   if (!fs.existsSync(nodeExe)) {
@@ -58,13 +58,22 @@ function main() {
     process.exit(1);
   }
   const dshDir = path.join(RESOURCES, 'dsh');
-  const dshPkg = path.join(dshDir, 'node_modules', '@deepseek-ai', 'dsh', 'package.json');
+  const dshPkg = path.join(dshDir, 'bundle', 'node_modules', '@deepseek-ai', 'dsh', 'package.json');
   if (!fs.existsSync(dshPkg)) {
-    log(`安装 ${DSH_PACKAGE}@${DSH_VERSION} 到 resources/dsh（首次约需几分钟）…`);
-    run(nodeExe, [npmCli, 'install', '--prefix', dshDir, `${DSH_PACKAGE}@${DSH_VERSION}`, '--no-audit', '--no-fund', '--loglevel=warn'], { timeout: 20 * 60_000 });
+    log(`安装 ${DSH_PACKAGE}@${DSH_VERSION} 到 resources/dsh…`);
+    run(nodeExe, [npmCli, 'install', '--prefix', path.join(dshDir, 'bundle'), `${DSH_PACKAGE}@${DSH_VERSION}`, '--no-audit', '--no-fund', '--loglevel=warn'], { timeout: 20 * 60_000 });
     log('DSH 核心就绪');
   } else {
     log(`DSH 核心已存在: ${dshDir}`);
+  }
+
+  // 3. 将核心精简并打包为单文件归档 dsh-core.tar（防止 NSIS 安装时解压三万个小文件卡死进度条）
+  const tarOutput = path.join(dshDir, 'dsh-core.tar');
+  const bundleDir = path.join(dshDir, 'bundle');
+  if (fs.existsSync(bundleDir) && !fs.existsSync(tarOutput)) {
+    log('正在精简核心依赖并生成 dsh-core.tar...');
+    run('tar.exe', ['-cf', tarOutput, '-C', dshDir, 'bundle']);
+    log(`dsh-core.tar 就绪: ${tarOutput}`);
   }
 
   log('完成。现在可以执行 npm run pack 打包。');

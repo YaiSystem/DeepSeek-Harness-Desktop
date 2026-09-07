@@ -46,7 +46,8 @@
         "from": "resources/dsh",
         "to": "dsh",
         "filter": [
-          "**/*"
+          "dsh-core.tar",
+          "package.json"
         ]
       }
     ],
