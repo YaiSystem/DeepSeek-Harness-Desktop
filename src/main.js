@@ -950,43 +950,144 @@ async function restartOwnServer() {
   log(`server restarted with updated dsh at ${state.url}`);
 }
 
-function downloadFile(url, destination, onProgress) {
+function downloadFile(url, destination, onProgress, redirects = 0) {
   return new Promise((resolve, reject) => {
+    if (redirects > 8) {
+      reject(new Error('下载重定向次数过多'));
+      return;
+    }
     const lib = String(url).startsWith('http:') ? http : https;
-    const output = fs.createWriteStream(destination);
+    const output = fs.createWriteStream(destination, { flags: redirects === 0 ? 'w' : 'a' });
+    let isHandled = false;
+
+    const cleanupAndReject = (err) => {
+      if (isHandled) return;
+      isHandled = true;
+      try { output.close(); } catch {}
+      try { fs.unlinkSync(destination); } catch {}
+      reject(err);
+    };
+
     const request = lib.get(url, {
-      timeout: UPDATE_FETCH_TIMEOUT_MS,
-      headers: { 'user-agent': 'DeepSeek-Harness-Desktop' },
+      timeout: DESKTOP_DOWNLOAD_TIMEOUT_MS,
+      headers: {
+        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        accept: '*/*',
+      },
     }, (response) => {
       if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
-        output.close();
-        try { fs.unlinkSync(destination); } catch {}
-        downloadFile(response.headers.location, destination, onProgress).then(resolve, reject);
+        isHandled = true;
+        response.resume();
+        output.close(() => {
+          try { fs.unlinkSync(destination); } catch {}
+          downloadFile(response.headers.location, destination, onProgress, redirects + 1).then(resolve, reject);
+        });
         return;
       }
       if (response.statusCode !== 200) {
         response.resume();
-        output.close();
-        reject(new Error(`下载更新包失败：HTTP ${response.statusCode}`));
+        cleanupAndReject(new Error(`下载更新包失败：HTTP ${response.statusCode}`));
         return;
       }
       const total = Number(response.headers['content-length']) || 0;
       let received = 0;
       response.on('data', (chunk) => {
         received += chunk.length;
-        onProgress(received, total);
+        if (onProgress) onProgress(received, total);
       });
-      response.on('error', reject);
-      output.on('finish', () => output.close(() => resolve()));
+      response.on('error', cleanupAndReject);
+      output.on('finish', () => {
+        output.close(() => {
+          if (isHandled) return;
+          isHandled = true;
+          try {
+            const stat = fs.statSync(destination);
+            // 安装包体积通常在 50MB 以上，小于 10MB 说明未完整下载
+            if (stat.size < 10 * 1024 * 1024) {
+              try { fs.unlinkSync(destination); } catch {}
+              reject(new Error(`更新包下载不完整（仅 ${Math.round(stat.size / 1024)} KB），已取消`));
+              return;
+            }
+            log(`installer downloaded successfully: ${destination} (${stat.size} bytes)`);
+            resolve();
+          } catch (err) {
+            reject(err);
+          }
+        });
+      });
       response.pipe(output);
     });
-    request.setTimeout(DESKTOP_DOWNLOAD_TIMEOUT_MS, () => request.destroy(new Error('下载更新包超时')));
-    request.on('error', (error) => {
-      try { output.close(); } catch {}
-      try { fs.unlinkSync(destination); } catch {}
-      reject(error);
+
+    request.setTimeout(DESKTOP_DOWNLOAD_TIMEOUT_MS, () => {
+      request.destroy(new Error('下载更新包超时'));
     });
+    request.on('error', cleanupAndReject);
   });
+}
+
+/**
+ * 彻底解决“进度条走完后软件关闭但不安装”的问题：
+ * 编写一个独立的外部升级守护脚本，完全脱离 Electron 主进程。
+ * 该脚本等待当前旧进程完全退出并释放所有文件占用后，再唤起安装程序进行更新。
+ */
+function launchInstallerAndExit(installerPath) {
+  const currentPid = process.pid;
+  const tempDir = os.tmpdir();
+  const batPath = path.join(tempDir, `dsh-update-helper-${Date.now()}.bat`);
+
+  const batContent = `@echo off
+chcp 65001 >nul
+:: 等待旧应用进程完全退出并释放文件句柄
+timeout /t 1 /nobreak >nul
+:wait_loop
+tasklist /FI "PID eq ${currentPid}" 2>nul | findstr /C:"${currentPid}" >nul
+if not errorlevel 1 (
+    timeout /t 1 /nobreak >nul
+    goto wait_loop
+)
+
+:: 确保后台残留进程已完全清理
+taskkill /F /T /IM "DeepSeek Harness.exe" 2>nul
+taskkill /F /T /IM "DeepSeek-Harness*.exe" 2>nul
+timeout /t 1 /nobreak >nul
+
+:: 启动安装程序（双重保险：先尝试自动更新，若未自动拉起则弹出安装向导）
+start "" "${installerPath}" /S --updated --force-run
+timeout /t 4 /nobreak >nul
+tasklist /FI "IMAGENAME eq DeepSeek Harness.exe" 2>nul | findstr /I /C:"DeepSeek Harness.exe" >nul
+if errorlevel 1 (
+    start "" "${installerPath}"
+)
+
+:: 自行清理辅助脚本
+del "%~f0" >nul 2>&1
+exit
+`;
+
+  try {
+    fs.writeFileSync(batPath, batContent, 'utf8');
+  } catch (e) {
+    log(`failed to write update bat: ${e.message}`);
+  }
+
+  log(`launching update helper script: ${batPath}`);
+  try {
+    const child = spawn('cmd.exe', ['/c', batPath], {
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true,
+    });
+    child.unref();
+  } catch (err) {
+    log(`spawn cmd update helper failed, fallback to shell.openPath: ${err.message}`);
+    shell.openPath(installerPath).catch(() => {});
+  }
+
+  state.quitting = true;
+  killChildTree();
+  setTimeout(() => {
+    app.quit();
+  }, 400);
 }
 
 async function startUnifiedUpdate(result) {
@@ -1001,6 +1102,7 @@ async function startUnifiedUpdate(result) {
 
     if (result.desktopAvailable) {
       const downloadPath = path.join(app.getPath('userData'), `DeepSeek-Harness-${result.desktop.version}-setup.exe`);
+      log(`downloading desktop installer from ${result.desktop.url} to ${downloadPath}`);
       await downloadFile(result.desktop.url, downloadPath, (received, total) => {
         if (total > 0) {
           const pct = Math.min(99, Math.round((received / total) * 100));
@@ -1009,17 +1111,11 @@ async function startUnifiedUpdate(result) {
           updateProgress(progress, `正在下载桌面应用更新包（${Math.round(received / 1024 / 1024)} MB）…`, null);
         }
       });
-      updateProgress(progress, '下载完成，正在启动安装程序…', 100);
+      updateProgress(progress, '下载完成，正在启动安装程序完成升级…', 100);
       setTimeout(() => {
         if (progress && !progress.isDestroyed()) progress.destroy();
-        state.quitting = true;
-        killChildTree();
-        app.once('quit', () => {
-          const installer = spawn(downloadPath, ['/S'], { detached: true, stdio: 'ignore', windowsHide: true });
-          installer.unref();
-        });
-        app.quit();
-      }, 350);
+        launchInstallerAndExit(downloadPath);
+      }, 600);
       return;
     }
 
