@@ -17,7 +17,7 @@
  *   --port <n>          override the port (default: DSH_PORT env or 3080)
  */
 
-const { app, BrowserWindow, Menu, dialog, shell, session } = require('electron');
+const { app, BrowserWindow, Menu, dialog, shell, session, ipcMain } = require('electron');
 const { spawn, spawnSync } = require('node:child_process');
 const http = require('node:http');
 const https = require('node:https');
@@ -1180,9 +1180,10 @@ function createMainWindow() {
     title: APP_NAME,
     icon: path.join(__dirname, '..', 'build', 'icon.png'),
     webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: true,
+      sandbox: false,
       spellcheck: false,
     },
   });
@@ -1346,6 +1347,14 @@ function installMenu() {
       ],
     },
     {
+      label: '📑 文件变更',
+      click: () => {
+        if (state.mainWindow && !state.mainWindow.isDestroyed()) {
+          state.mainWindow.webContents.send('dsh:toggle-sidebar');
+        }
+      },
+    },
+    {
       label: '🔄 检查更新',
       click: triggerManualUpdateCheck,
     },
@@ -1381,6 +1390,228 @@ async function triggerManualUpdateCheck() {
   }
 }
 
+// ---------------------------------------------------------------- 项目变更与文件预览 IPC
+
+function initProjectChangesIpc() {
+  // 1. 获取所有已知的工作区列表
+  ipcMain.handle('dsh:get-workspaces', async () => {
+    try {
+      const workspaceFile = path.join(os.homedir(), '.dsh', 'storages', 'workspace.json');
+      if (fs.existsSync(workspaceFile)) {
+        const data = JSON.parse(fs.readFileSync(workspaceFile, 'utf8'));
+        const list = [];
+        if (data && data.tables && data.tables.workspaces) {
+          for (const [id, ws] of Object.entries(data.tables.workspaces)) {
+            if (ws && ws.path) {
+              list.push({
+                workspaceId: id,
+                path: ws.path,
+                title: ws.title || path.basename(ws.path),
+                updatedAt: ws.updatedAt || ws.createdAt || '',
+              });
+            }
+          }
+        }
+        // 按最后更新时间倒序
+        list.sort((a, b) => (b.updatedAt > a.updatedAt ? 1 : -1));
+        if (list.length > 0) return list;
+      }
+    } catch (err) {
+      log(`read workspace.json failed: ${err.message}`);
+    }
+    return [{ path: process.cwd(), title: '当前目录' }];
+  });
+
+  // 2. 获取默认/首选工作区路径
+  ipcMain.handle('dsh:get-default-path', async () => {
+    try {
+      const workspaceFile = path.join(os.homedir(), '.dsh', 'storages', 'workspace.json');
+      if (fs.existsSync(workspaceFile)) {
+        const data = JSON.parse(fs.readFileSync(workspaceFile, 'utf8'));
+        if (data && data.tables && data.tables.workspaces) {
+          const list = Object.values(data.tables.workspaces).filter(Boolean);
+          list.sort((a, b) => (b.updatedAt > a.updatedAt ? 1 : -1));
+          if (list.length > 0 && list[0].path) return list[0].path;
+        }
+      }
+    } catch {}
+    return process.cwd();
+  });
+
+  // 3. 扫描指定项目目录的文件变更（新增、修改、删除）
+  ipcMain.handle('dsh:get-changes', async (event, projectPath) => {
+    if (!projectPath || !fs.existsSync(projectPath)) {
+      return { changes: [], counts: { added: 0, modified: 0, deleted: 0 } };
+    }
+
+    try {
+      // 优先尝试执行 git status 获取最准确、最标准的版本变更信息
+      const gitRes = spawnSync('git', ['status', '--porcelain=v1', '-uall'], {
+        cwd: projectPath,
+        encoding: 'utf8',
+        timeout: 15000,
+        windowsHide: true,
+      });
+
+      if (gitRes.status === 0 && typeof gitRes.stdout === 'string') {
+        const lines = gitRes.stdout.split(/\r?\n/).filter(Boolean);
+        const changes = [];
+        let added = 0;
+        let modified = 0;
+        let deleted = 0;
+
+        for (const line of lines) {
+          if (line.length < 4) continue;
+          const indexStatus = line[0];
+          const workTreeStatus = line[1];
+          let relPath = line.substring(3).trim();
+          // 处理重命名 R "old" -> "new"
+          if (relPath.includes(' -> ')) {
+            relPath = relPath.split(' -> ')[1].trim();
+          }
+          // 去除首尾可能的引号
+          relPath = relPath.replace(/^["']|["']$/g, '');
+
+          let status = 'modified';
+          if (indexStatus === '?' && workTreeStatus === '?') {
+            status = 'added';
+            added++;
+          } else if (indexStatus === 'A' || workTreeStatus === 'A') {
+            status = 'added';
+            added++;
+          } else if (indexStatus === 'D' || workTreeStatus === 'D') {
+            status = 'deleted';
+            deleted++;
+          } else {
+            status = 'modified';
+            modified++;
+          }
+
+          changes.push({
+            path: relPath.replace(/\\/g, '/'),
+            fullPath: path.join(projectPath, relPath),
+            status,
+          });
+        }
+
+        return { changes, counts: { added, modified, deleted } };
+      }
+    } catch (err) {
+      log(`git status check error in ${projectPath}: ${err.message}`);
+    }
+
+    // 若不是 git 仓库或执行出错，进行最近修改时间回退扫描（扫描 48 小时内修改过的文件）
+    try {
+      const changes = [];
+      const threshold = Date.now() - 48 * 3600 * 1000;
+      const ignoreNames = new Set(['node_modules', '.git', 'dist', 'dist-build', 'build', 'resources', '.smoke-ud', '.vscode']);
+
+      function scanDir(dir, depth = 0) {
+        if (depth > 6 || changes.length > 100) return;
+        let entries = [];
+        try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+        for (const ent of entries) {
+          if (ignoreNames.has(ent.name)) continue;
+          const full = path.join(dir, ent.name);
+          if (ent.isDirectory()) {
+            scanDir(full, depth + 1);
+          } else if (ent.isFile()) {
+            try {
+              const st = fs.statSync(full);
+              if (st.mtimeMs >= threshold) {
+                const rel = path.relative(projectPath, full).replace(/\\/g, '/');
+                changes.push({
+                  path: rel,
+                  fullPath: full,
+                  status: 'modified',
+                });
+              }
+            } catch {}
+          }
+        }
+      }
+
+      scanDir(projectPath);
+      return {
+        changes,
+        counts: { added: 0, modified: changes.length, deleted: 0 },
+      };
+    } catch (err) {
+      return { changes: [], counts: { added: 0, modified: 0, deleted: 0 } };
+    }
+  });
+
+  // 4. 获取文件内容（文本或图片）
+  ipcMain.handle('dsh:get-file-content', async (event, fullPath) => {
+    if (!fullPath || !fs.existsSync(fullPath)) {
+      return { type: 'error', message: '文件不存在' };
+    }
+    try {
+      const stat = fs.statSync(fullPath);
+      if (stat.isDirectory()) {
+        return { type: 'error', message: '这是一个目录' };
+      }
+
+      const ext = path.extname(fullPath).toLowerCase();
+      const imageExts = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.ico']);
+      if (imageExts.has(ext)) {
+        const mime = ext === '.svg' ? 'image/svg+xml' : ext === '.ico' ? 'image/x-icon' : `image/${ext.replace('.', '')}`;
+        const buf = fs.readFileSync(fullPath);
+        return {
+          type: 'image',
+          dataUrl: `data:${mime};base64,${buf.toString('base64')}`,
+        };
+      }
+
+      // 文本文件：最大支持 4MB，超出截断
+      const MAX_TEXT_SIZE = 4 * 1024 * 1024;
+      if (stat.size > MAX_TEXT_SIZE) {
+        const fd = fs.openSync(fullPath, 'r');
+        const buf = Buffer.alloc(MAX_TEXT_SIZE);
+        fs.readSync(fd, buf, 0, MAX_TEXT_SIZE, 0);
+        fs.closeSync(fd);
+        return {
+          type: 'text',
+          content: buf.toString('utf8') + '\n\n... [文件体积过大，已自动截断前 4MB 预览] ...',
+        };
+      }
+
+      const content = fs.readFileSync(fullPath, 'utf8');
+      return {
+        type: 'text',
+        content,
+      };
+    } catch (err) {
+      return { type: 'error', message: err.message || String(err) };
+    }
+  });
+
+  // 5. 在系统资源管理器中高亮定位文件
+  ipcMain.handle('dsh:show-in-folder', async (event, fullPath) => {
+    try {
+      if (fullPath && fs.existsSync(fullPath)) {
+        shell.showItemInFolder(fullPath);
+        return true;
+      }
+    } catch {}
+    return false;
+  });
+
+  // 6. 弹出文件夹选择器
+  ipcMain.handle('dsh:select-folder', async () => {
+    try {
+      const res = await dialog.showOpenDialog(state.mainWindow, {
+        title: '选择项目根目录',
+        properties: ['openDirectory'],
+      });
+      if (!res.canceled && res.filePaths && res.filePaths.length > 0) {
+        return res.filePaths[0];
+      }
+    } catch {}
+    return null;
+  });
+}
+
 // ---------------------------------------------------------------- app lifecycle
 
 const gotLock = app.requestSingleInstanceLock();
@@ -1399,6 +1630,7 @@ if (!gotLock) {
   app.whenReady().then(async () => {
     app.setAppUserModelId(APP_USER_MODEL_ID);
     installMenu();
+    initProjectChangesIpc();
 
     // 测试钩子 2：把最新版安装到临时 prefix（不触碰全局安装），验证更新命令可行
     if (updateInstallTestPrefix) {
