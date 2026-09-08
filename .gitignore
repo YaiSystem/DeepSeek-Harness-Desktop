@@ -11,6 +11,8 @@ builder-debug.yml
 # 测试产物
 smoke-*.json
 upd-*.json
+"DeepSeek Harness/"
+DeepSeek Harness/
 
 # 系统杂项
 .DS_Store
