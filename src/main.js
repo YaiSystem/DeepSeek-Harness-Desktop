@@ -1026,68 +1026,29 @@ function downloadFile(url, destination, onProgress, redirects = 0) {
 }
 
 /**
- * 彻底解决“进度条走完后软件关闭但不安装”的问题：
- * 编写一个独立的外部升级守护脚本，完全脱离 Electron 主进程。
- * 该脚本等待当前旧进程完全退出并释放所有文件占用后，再唤起安装程序进行更新。
+ * 启动正常安装页面并退出当前旧程序：
+ * 直接使用系统 Shell 打开下载好的 setup.exe，绝不启动任何 cmd.exe 控制台（零黑窗口）；
+ * 直接弹出清晰规范的标准 Windows 安装向导页面，带有真实的绿色进度条；
+ * 随后当前旧程序正常退出，释放所有文件占用，保证覆盖安装顺畅完成。
  */
 function launchInstallerAndExit(installerPath) {
-  const currentPid = process.pid;
-  const tempDir = os.tmpdir();
-  const batPath = path.join(tempDir, `dsh-update-helper-${Date.now()}.bat`);
-
-  const batContent = `@echo off
-chcp 65001 >nul
-:: 等待旧应用进程完全退出并释放文件句柄
-timeout /t 1 /nobreak >nul
-:wait_loop
-tasklist /FI "PID eq ${currentPid}" 2>nul | findstr /C:"${currentPid}" >nul
-if not errorlevel 1 (
-    timeout /t 1 /nobreak >nul
-    goto wait_loop
-)
-
-:: 确保后台残留进程已完全清理
-taskkill /F /T /IM "DeepSeek Harness.exe" 2>nul
-taskkill /F /T /IM "DeepSeek-Harness*.exe" 2>nul
-timeout /t 1 /nobreak >nul
-
-:: 启动安装程序（双重保险：先尝试自动更新，若未自动拉起则弹出安装向导）
-start "" "${installerPath}" /S --updated --force-run
-timeout /t 4 /nobreak >nul
-tasklist /FI "IMAGENAME eq DeepSeek Harness.exe" 2>nul | findstr /I /C:"DeepSeek Harness.exe" >nul
-if errorlevel 1 (
-    start "" "${installerPath}"
-)
-
-:: 自行清理辅助脚本
-del "%~f0" >nul 2>&1
-exit
-`;
-
+  log(`launching installer directly via shell: ${installerPath}`);
   try {
-    fs.writeFileSync(batPath, batContent, 'utf8');
-  } catch (e) {
-    log(`failed to write update bat: ${e.message}`);
-  }
-
-  log(`launching update helper script: ${batPath}`);
-  try {
-    const child = spawn('cmd.exe', ['/c', batPath], {
-      detached: true,
-      stdio: 'ignore',
-      windowsHide: true,
+    shell.openPath(installerPath).then((errMsg) => {
+      if (errMsg) log(`shell.openPath returned error: ${errMsg}`);
+    }).catch((err) => {
+      log(`shell.openPath exception: ${err.message}`);
     });
-    child.unref();
-  } catch (err) {
-    log(`spawn cmd update helper failed, fallback to shell.openPath: ${err.message}`);
-    shell.openPath(installerPath).catch(() => {});
+  } catch (e) {
+    log(`open installer failed: ${e.message}`);
   }
 
+  // 延时半秒释放 node 子服务与当前窗口，让出所有文件锁，使刚刚打开的安装向导能够顺畅覆盖
   state.quitting = true;
   killChildTree();
   setTimeout(() => {
     app.quit();
-  }, 400);
+  }, 500);
 }
 
 async function startUnifiedUpdate(result) {
@@ -1111,11 +1072,11 @@ async function startUnifiedUpdate(result) {
           updateProgress(progress, `正在下载桌面应用更新包（${Math.round(received / 1024 / 1024)} MB）…`, null);
         }
       });
-      updateProgress(progress, '下载完成，正在启动安装程序完成升级…', 100);
+      updateProgress(progress, '下载完成，正在打开安装程序…', 100);
       setTimeout(() => {
         if (progress && !progress.isDestroyed()) progress.destroy();
         launchInstallerAndExit(downloadPath);
-      }, 600);
+      }, 500);
       return;
     }
 
@@ -1347,7 +1308,8 @@ function installMenu() {
       ],
     },
     {
-      label: '📑 文件变更',
+      label: '📑 文件变更 (Ctrl+B)',
+      accelerator: 'CommandOrControl+B',
       click: () => {
         if (state.mainWindow && !state.mainWindow.isDestroyed()) {
           state.mainWindow.webContents.send('dsh:toggle-sidebar');
@@ -1392,49 +1354,85 @@ async function triggerManualUpdateCheck() {
 
 // ---------------------------------------------------------------- 项目变更与文件预览 IPC
 
-function initProjectChangesIpc() {
-  // 1. 获取所有已知的工作区列表
-  ipcMain.handle('dsh:get-workspaces', async () => {
+function getSmartWorkspaces() {
+  const dshHome = path.join(os.homedir(), '.dsh');
+  const workspaceFile = path.join(dshHome, 'storages', 'workspace.json');
+  const sessionsDir = path.join(dshHome, 'sessions');
+
+  let workspaces = [];
+  if (fs.existsSync(workspaceFile)) {
     try {
-      const workspaceFile = path.join(os.homedir(), '.dsh', 'storages', 'workspace.json');
-      if (fs.existsSync(workspaceFile)) {
-        const data = JSON.parse(fs.readFileSync(workspaceFile, 'utf8'));
-        const list = [];
-        if (data && data.tables && data.tables.workspaces) {
-          for (const [id, ws] of Object.entries(data.tables.workspaces)) {
-            if (ws && ws.path) {
-              list.push({
-                workspaceId: id,
-                path: ws.path,
-                title: ws.title || path.basename(ws.path),
-                updatedAt: ws.updatedAt || ws.createdAt || '',
-              });
-            }
-          }
-        }
-        // 按最后更新时间倒序
-        list.sort((a, b) => (b.updatedAt > a.updatedAt ? 1 : -1));
-        if (list.length > 0) return list;
+      const data = JSON.parse(fs.readFileSync(workspaceFile, 'utf8'));
+      if (data && data.tables && data.tables.workspaces) {
+        workspaces = Object.entries(data.tables.workspaces).map(([id, ws]) => ({
+          workspaceId: id,
+          path: ws.path,
+          title: ws.title || path.basename(ws.path),
+          sessionIds: ws.sessionIds || [],
+          updatedAt: ws.updatedAt || ws.createdAt || '',
+          latestActivity: 0,
+        }));
       }
     } catch (err) {
       log(`read workspace.json failed: ${err.message}`);
     }
+  }
+
+  // 关键：扫描 .dsh/sessions 下各工作区实际会话文件的真实最后修改时间 (LastWriteTime)
+  // 谁最近被用户或 AI 写入/对话，谁就是当前真正活跃的工作区！
+  if (fs.existsSync(sessionsDir)) {
+    for (const ws of workspaces) {
+      if (!ws.path) continue;
+      const normalizedPath = ws.path.replace(/[:\\/]+/g, '-');
+      const wsSessionDir = path.join(sessionsDir, `--${normalizedPath}--`);
+      if (fs.existsSync(wsSessionDir)) {
+        try {
+          const files = fs.readdirSync(wsSessionDir, { recursive: true });
+          for (const f of files) {
+            try {
+              const full = path.join(wsSessionDir, f);
+              const st = fs.statSync(full);
+              if (st.mtimeMs > ws.latestActivity) {
+                ws.latestActivity = st.mtimeMs;
+              }
+            } catch {}
+          }
+        } catch {}
+      }
+    }
+  }
+
+  // 按照真实最近活动时间降序排序，最近活跃的项目永远排在第 1 位
+  workspaces.sort((a, b) => {
+    if (b.latestActivity !== a.latestActivity) {
+      return b.latestActivity - a.latestActivity;
+    }
+    return b.updatedAt > a.updatedAt ? 1 : -1;
+  });
+
+  return workspaces;
+}
+
+function initProjectChangesIpc() {
+  // 1. 获取所有已知的工作区列表（已按最近活跃时间精准排序）
+  ipcMain.handle('dsh:get-workspaces', async () => {
+    try {
+      const list = getSmartWorkspaces();
+      if (list.length > 0) return list;
+    } catch (err) {
+      log(`get-workspaces failed: ${err.message}`);
+    }
     return [{ path: process.cwd(), title: '当前目录' }];
   });
 
-  // 2. 获取默认/首选工作区路径
+  // 2. 获取默认/首选工作区路径（直接返回当前最活跃的项目路径）
   ipcMain.handle('dsh:get-default-path', async () => {
     try {
-      const workspaceFile = path.join(os.homedir(), '.dsh', 'storages', 'workspace.json');
-      if (fs.existsSync(workspaceFile)) {
-        const data = JSON.parse(fs.readFileSync(workspaceFile, 'utf8'));
-        if (data && data.tables && data.tables.workspaces) {
-          const list = Object.values(data.tables.workspaces).filter(Boolean);
-          list.sort((a, b) => (b.updatedAt > a.updatedAt ? 1 : -1));
-          if (list.length > 0 && list[0].path) return list[0].path;
-        }
-      }
-    } catch {}
+      const list = getSmartWorkspaces();
+      if (list.length > 0 && list[0].path) return list[0].path;
+    } catch (err) {
+      log(`get-default-path failed: ${err.message}`);
+    }
     return process.cwd();
   });
 

@@ -5,6 +5,23 @@ const { ipcRenderer } = require('electron');
 window.addEventListener('DOMContentLoaded', () => {
   if (window.self !== window.top) return;
 
+  // 1. 在宿主网页的 head 中注入页面自适应收窄样式（使侧边栏打开时对话框平滑变窄，绝不遮挡视野）
+  const hostStyle = document.createElement('style');
+  hostStyle.id = 'dsh-page-layout-adapter';
+  hostStyle.textContent = `
+    html {
+      transition: width 0.22s cubic-bezier(0.16, 1, 0.3, 1), margin-right 0.22s cubic-bezier(0.16, 1, 0.3, 1) !important;
+    }
+    html.dsh-sidebar-expanded {
+      margin-right: 400px !important;
+      width: calc(100vw - 400px) !important;
+      max-width: calc(100vw - 400px) !important;
+      overflow-x: hidden !important;
+    }
+  `;
+  document.head.appendChild(hostStyle);
+
+  // 2. 挂载侧边栏 Shadow DOM
   const hostEl = document.createElement('div');
   hostEl.id = 'dsh-sidebar-host';
   document.body.appendChild(hostEl);
@@ -15,62 +32,16 @@ window.addEventListener('DOMContentLoaded', () => {
   style.textContent = `
     * { box-sizing: border-box; margin: 0; padding: 0; }
 
-    /* 右侧边栏切换按钮（清爽简约的图标按钮，像浏览器侧边栏一样） */
-    .sidebar-toggle-btn {
-      position: fixed;
-      top: 12px;
-      right: 14px;
-      z-index: 999998;
-      display: inline-flex;
-      align-items: center;
-      gap: 5px;
-      padding: 5px 10px;
-      background: rgba(24, 24, 32, 0.88);
-      border: 1px solid rgba(255, 255, 255, 0.14);
-      border-radius: 6px;
-      color: #cfd3dc;
-      font-size: 12px;
-      font-weight: 500;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      cursor: pointer;
-      backdrop-filter: blur(8px);
-      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
-      transition: all 0.18s ease;
-      user-select: none;
-    }
-    .sidebar-toggle-btn:hover {
-      background: rgba(38, 38, 50, 0.96);
-      color: #ffffff;
-      border-color: rgba(255, 255, 255, 0.28);
-    }
-    .badge {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      min-width: 16px;
-      height: 16px;
-      padding: 0 4px;
-      border-radius: 8px;
-      font-size: 10px;
-      font-weight: 700;
-      background: #3b82f6;
-      color: #fff;
-    }
-    .badge.empty {
-      display: none;
-    }
-
-    /* 右侧侧边栏面板 */
+    /* 右侧边栏面板（400px 宽度，与网页内容平铺并列，不覆盖对话框） */
     .sidebar {
       position: fixed;
       top: 0;
-      right: -440px;
-      width: 440px;
+      right: -400px;
+      width: 400px;
       height: 100vh;
-      max-width: 90vw;
       background: #14141b;
       border-left: 1px solid rgba(255, 255, 255, 0.1);
-      box-shadow: -6px 0 24px rgba(0, 0, 0, 0.6);
+      box-shadow: -6px 0 24px rgba(0, 0, 0, 0.5);
       z-index: 999999;
       display: flex;
       flex-direction: column;
@@ -88,6 +59,11 @@ window.addEventListener('DOMContentLoaded', () => {
       background: #191923;
       border-bottom: 1px solid rgba(255, 255, 255, 0.08);
       display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .header-row {
+      display: flex;
       align-items: center;
       justify-content: space-between;
     }
@@ -103,6 +79,37 @@ window.addEventListener('DOMContentLoaded', () => {
       display: flex;
       align-items: center;
       gap: 6px;
+    }
+    .project-bar {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      background: #0e0e14;
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: 4px;
+      padding: 3px 8px;
+    }
+    .project-icon {
+      color: #60a5fa;
+      flex-shrink: 0;
+    }
+    .project-dropdown {
+      flex: 1;
+      background: transparent;
+      border: none;
+      color: #93c5fd;
+      font-size: 11px;
+      font-weight: 500;
+      font-family: inherit;
+      outline: none;
+      cursor: pointer;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .project-dropdown option {
+      background: #191923;
+      color: #e5e7eb;
     }
     .btn-icon {
       width: 26px;
@@ -237,44 +244,38 @@ window.addEventListener('DOMContentLoaded', () => {
   `;
   shadow.appendChild(style);
 
-  // 1. 顶部切换按钮
-  const toggleBtn = document.createElement('div');
-  toggleBtn.className = 'sidebar-toggle-btn';
-  toggleBtn.title = '项目文件变更侧边栏';
-  toggleBtn.innerHTML = `
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-      <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
-      <line x1="15" y1="3" x2="15" y2="21"></line>
-    </svg>
-    <span>变更</span>
-    <span class="badge empty" id="badge">0</span>
-  `;
-  shadow.appendChild(toggleBtn);
-
-  // 2. 侧边栏
+  // 3. 侧边栏结构
   const sidebar = document.createElement('div');
   sidebar.className = 'sidebar';
   sidebar.innerHTML = `
     <div class="sidebar-header">
-      <div class="header-title">
-        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
-          <line x1="15" y1="3" x2="15" y2="21"></line>
-        </svg>
-        <span id="title-text">项目文件变更</span>
+      <div class="header-row">
+        <div class="header-title">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+            <line x1="15" y1="3" x2="15" y2="21"></line>
+          </svg>
+          <span id="title-text">项目文件变更</span>
+        </div>
+        <div class="header-actions">
+          <button class="btn-icon" id="btn-refresh" title="刷新变更">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"></path>
+            </svg>
+          </button>
+          <button class="btn-icon" id="btn-close" title="收起侧边栏 (Ctrl+B)">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="18" y1="6" x2="6" y2="18"></line>
+              <line x1="6" y1="6" x2="18" y2="18"></line>
+            </svg>
+          </button>
+        </div>
       </div>
-      <div class="header-actions">
-        <button class="btn-icon" id="btn-refresh" title="刷新变更">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"></path>
-          </svg>
-        </button>
-        <button class="btn-icon" id="btn-close" title="收起侧边栏">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <line x1="18" y1="6" x2="6" y2="18"></line>
-            <line x1="6" y1="6" x2="18" y2="18"></line>
-          </svg>
-        </button>
+      <div class="project-bar">
+        <svg class="project-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
+        </svg>
+        <select id="project-dropdown" class="project-dropdown" title="当前查看的项目"></select>
       </div>
     </div>
     <div class="files-pane" id="files-pane">
@@ -300,33 +301,41 @@ window.addEventListener('DOMContentLoaded', () => {
   const state = {
     open: false,
     projectDir: '',
+    workspaces: [],
     files: [],
     selectedPath: '',
     currentText: '',
   };
 
-  const elBadge = shadow.getElementById('badge');
+  const elProjectDropdown = shadow.getElementById('project-dropdown');
   const elFilesPane = shadow.getElementById('files-pane');
   const elTitleText = shadow.getElementById('title-text');
   const elPreviewFilename = shadow.getElementById('preview-filename');
   const elPreviewBody = shadow.getElementById('preview-body');
   const elBtnCopy = shadow.getElementById('btn-copy');
 
+  // 用户手动切换下拉框项目
+  elProjectDropdown.addEventListener('change', (e) => {
+    state.projectDir = e.target.value;
+    state.selectedPath = '';
+    loadChanges(false);
+  });
+
+  // 核心：侧边栏展开时让主网页平滑收缩 400px，收起时平滑复原，绝不遮挡对话框！
   function setOpen(open) {
-    state.open = open;
+    state.open = typeof open === 'boolean' ? open : !state.open;
     if (state.open) {
       sidebar.classList.add('open');
-      toggleBtn.style.opacity = '0';
-      loadChanges();
+      document.documentElement.classList.add('dsh-sidebar-expanded');
+      loadChanges(true);
     } else {
       sidebar.classList.remove('open');
-      toggleBtn.style.opacity = '1';
+      document.documentElement.classList.remove('dsh-sidebar-expanded');
     }
   }
 
-  toggleBtn.addEventListener('click', () => setOpen(true));
   shadow.getElementById('btn-close').addEventListener('click', () => setOpen(false));
-  shadow.getElementById('btn-refresh').addEventListener('click', loadChanges);
+  shadow.getElementById('btn-refresh').addEventListener('click', () => loadChanges(true));
 
   elBtnCopy.addEventListener('click', () => {
     if (state.currentText) {
@@ -338,23 +347,40 @@ window.addEventListener('DOMContentLoaded', () => {
     }
   });
 
-  async function loadChanges() {
+  async function loadChanges(refreshWorkspaces = true) {
     elFilesPane.innerHTML = '<div class="empty-msg">正在扫描项目变更…</div>';
     try {
+      if (refreshWorkspaces || !state.projectDir) {
+        const wsList = await ipcRenderer.invoke('dsh:get-workspaces');
+        state.workspaces = Array.isArray(wsList) ? wsList : [];
+
+        // 刷新下拉菜单
+        elProjectDropdown.innerHTML = '';
+        state.workspaces.forEach((ws) => {
+          const opt = document.createElement('option');
+          opt.value = ws.path;
+          opt.textContent = `${ws.title || pathBasename(ws.path)} (${ws.path})`;
+          elProjectDropdown.appendChild(opt);
+        });
+
+        // 默认自动锁定当前最新活跃的项目（排在第 1 位）
+        if (!state.projectDir || refreshWorkspaces) {
+          if (state.workspaces.length > 0) {
+            state.projectDir = state.workspaces[0].path;
+            elProjectDropdown.value = state.projectDir;
+          }
+        }
+      }
+
       if (!state.projectDir) {
         state.projectDir = await ipcRenderer.invoke('dsh:get-default-path');
+        elProjectDropdown.value = state.projectDir;
       }
+
       const res = await ipcRenderer.invoke('dsh:get-changes', state.projectDir);
       state.files = res.changes || [];
       const count = state.files.length;
       elTitleText.textContent = `项目变更 (${count})`;
-
-      if (count > 0) {
-        elBadge.textContent = count;
-        elBadge.classList.remove('empty');
-      } else {
-        elBadge.classList.add('empty');
-      }
 
       if (count === 0) {
         elFilesPane.innerHTML = '<div class="empty-msg">当前项目没有文件变更</div>';
@@ -396,6 +422,14 @@ window.addEventListener('DOMContentLoaded', () => {
         const firstRow = elFilesPane.querySelector('.file-row');
         if (firstRow) firstRow.classList.add('active');
         loadFileContent(state.files[0]);
+      } else if (state.selectedPath) {
+        const currentSelected = state.files.find((f) => f.path === state.selectedPath);
+        if (currentSelected) {
+          loadFileContent(currentSelected);
+        } else if (state.files.length > 0) {
+          state.selectedPath = state.files[0].path;
+          loadFileContent(state.files[0]);
+        }
       }
     } catch (e) {
       elFilesPane.innerHTML = `<div class="empty-msg">扫描失败: ${escapeHtml(e.message || String(e))}</div>`;
@@ -445,20 +479,16 @@ window.addEventListener('DOMContentLoaded', () => {
     return String(str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   }
 
-  // 接收主进程菜单栏或其他通知直接开关侧边栏
+  // 接收主进程菜单栏（或快捷键 Ctrl+B）直接开合侧边栏
   ipcRenderer.on('dsh:toggle-sidebar', () => {
     setOpen(!state.open);
   });
 
-  // 初始静默拉取一次角标数字
-  ipcRenderer.invoke('dsh:get-default-path').then((dir) => {
-    state.projectDir = dir;
-    ipcRenderer.invoke('dsh:get-changes', dir).then((res) => {
-      const count = (res.changes || []).length;
-      if (count > 0) {
-        elBadge.textContent = count;
-        elBadge.classList.remove('empty');
-      }
-    }).catch(() => {});
-  }).catch(() => {});
+  // 网页内键盘监听：按 Ctrl+B 直接开合
+  window.addEventListener('keydown', (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'b') {
+      e.preventDefault();
+      setOpen(!state.open);
+    }
+  });
 });
