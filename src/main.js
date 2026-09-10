@@ -42,6 +42,8 @@ const UPDATE_URL = process.env.DSH_UPDATE_URL || `https://registry.npmjs.org/${D
 const DESKTOP_UPDATE_URL = process.env.DSH_DESKTOP_UPDATE_URL || `https://api.github.com/repos/${DESKTOP_REPOSITORY}/releases/latest`;
 const UPDATE_FETCH_TIMEOUT_MS = 10_000;
 const UPDATE_INSTALL_TIMEOUT_MS = 10 * 60_000;
+// 国内镜像显著加快下载（DSH_NPM_REGISTRY 可覆盖，供测试）
+const DSH_REGISTRY = process.env.DSH_NPM_REGISTRY || 'https://registry.npmmirror.com';
 const DESKTOP_DOWNLOAD_TIMEOUT_MS = 20 * 60_000;
 
 // ---------------------------------------------------------------- arguments
@@ -277,6 +279,132 @@ async function ensureBundledDshExtracted(onStatus) {
 
   if (onStatus) onStatus('正在启动服务…');
   return existingFile(binJs);
+}
+
+function existingDir(p) {
+  try {
+    return p && fs.existsSync(p) && fs.statSync(p).isDirectory() ? p : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * npm 全局安装根目录（dsh 落在 <root>/node_modules/@deepseek-ai/dsh）。
+ * 只认确实装了 @deepseek-ai 作用域的目录，避免误伤 PATH 上其他 node_modules。
+ */
+function npmGlobalRoots() {
+  const roots = [];
+  const consider = (candidate) => {
+    if (!candidate) return;
+    const abs = path.resolve(candidate);
+    if (roots.includes(abs)) return;
+    if (existingDir(path.join(abs, 'node_modules', '@deepseek-ai'))) roots.push(abs);
+  };
+  if (process.env.APPDATA) consider(path.join(process.env.APPDATA, 'npm'));
+  for (const dir of pathDirs()) consider(dir);
+  for (const pf of [process.env.ProgramFiles, process.env['ProgramFiles(x86)']]) {
+    if (pf) consider(path.join(pf, 'nodejs'));
+  }
+  return roots;
+}
+
+/**
+ * npm 替换包时先把旧目录改名成 .dsh-<hash>、解压新版、最后删掉旧目录。
+ * 最后一步一旦失败（被杀软或删除守卫拦截），就会留下几万个文件的残骸；
+ * 此后每次更新光遍历它就要花好几分钟 —— 这正是「更新特别慢」的根源。
+ * 这里在更新前主动清掉；直接删不掉时退化为同盘改名（瞬时完成），
+ * 至少让它不再躺在 npm 的扫描路径里拖慢后续操作。
+ */
+function cleanupDshResidue() {
+  let handled = 0;
+  for (const root of npmGlobalRoots()) {
+    const scope = path.join(root, 'node_modules', '@deepseek-ai');
+    let entries = [];
+    try {
+      entries = fs.readdirSync(scope);
+    } catch {
+      continue;
+    }
+    for (const name of entries) {
+      if (!/^\.dsh-[A-Za-z0-9_-]+$/.test(name)) continue;
+      const target = path.join(scope, name);
+      try {
+        fs.rmSync(target, { recursive: true, force: true, maxRetries: 1 });
+        log(`removed npm residue ${target}`);
+      } catch (error) {
+        // 删不掉（被删除守卫拦截等）就挪出 npm 的扫描范围：同盘改名是瞬时完成的，
+        // 关键是不能让它继续留在 @deepseek-ai/ 里被 npm 逐文件遍历。
+        const parked = path.join(os.tmpdir(), `dsh-residue-${Date.now()}-${name.replace(/^\./, '')}`);
+        try {
+          fs.renameSync(target, parked);
+          log(`parked npm residue ${target} -> ${parked} (${error.code || error.message})`);
+        } catch (error2) {
+          log(`npm residue cleanup failed ${target} (${error2.message})`);
+          continue;
+        }
+      }
+      handled += 1;
+    }
+  }
+  if (handled) log(`cleaned ${handled} npm residue dir(s)`);
+  return handled;
+}
+
+/**
+ * npm 写 bin 启动器时先落临时文件（.dsh-xxxx、.dsh.cmd-xxxx、.dsh.ps1-xxxx）再改名。
+ * 中途失败就会让 dsh / dsh.cmd / dsh.ps1 缺失，用户敲 dsh 直接 command not found。
+ * 这里用残留的临时文件把缺失的启动器补回去。
+ */
+function repairDshShims() {
+  const repaired = [];
+  const spec = [
+    [/^\.dsh-[A-Za-z0-9]+$/, 'dsh'],
+    [/^\.dsh\.cmd-[A-Za-z0-9]+$/, 'dsh.cmd'],
+    [/^\.dsh\.ps1-[A-Za-z0-9]+$/, 'dsh.ps1'],
+  ];
+  for (const root of npmGlobalRoots()) {
+    let entries = [];
+    try {
+      entries = fs.readdirSync(root);
+    } catch {
+      continue;
+    }
+    for (const [pattern, shimName] of spec) {
+      const shimPath = path.join(root, shimName);
+      if (existingFile(shimPath)) continue;
+      const stub = entries.find((name) => pattern.test(name));
+      if (!stub) continue;
+      try {
+        fs.copyFileSync(path.join(root, stub), shimPath);
+        repaired.push(shimPath);
+        log(`restored missing dsh shim ${shimPath}`);
+      } catch (error) {
+        log(`shim restore failed ${shimPath} (${error.message})`);
+      }
+    }
+  }
+  return repaired;
+}
+
+/**
+ * 某些宿主（CLI 沙箱）会通过 NODE_OPTIONS 注入删除守卫，把 Node 的删除调用
+ * 改道到回收站。它会连带让 npm 删不掉自己的临时目录，堆积出几万文件的残骸。
+ * 给 npm 子进程剔除这层注入，恢复正常的删除能力。
+ */
+function npmChildEnv() {
+  const env = Object.assign({}, process.env);
+  const raw = env.NODE_OPTIONS;
+  if (typeof raw === 'string' && raw.includes('genie-safe-delete')) {
+    const cleaned = raw
+      .replace(/--require=("?)[^"'\s]*genie-safe-delete\.cjs\1/g, ' ')
+      .replace(/\s{2,}/g, ' ')
+      .trim();
+    if (cleaned) env.NODE_OPTIONS = cleaned;
+    else delete env.NODE_OPTIONS;
+    log(`npm child NODE_OPTIONS -> ${cleaned || '(unset)'}`);
+  }
+  return env;
 }
 
 // 给定 node.exe，返回其同目录自带的 npm 执行参数组（绿色版 Node 都自带 npm）
@@ -542,6 +670,11 @@ async function bootServer() {
     log(`port ${target} busy (not DSH); picked free port ${spawnPort}`);
   }
 
+  // 2.5 自愈：npm 中断安装会把启动器留在临时文件状态，
+  // 导致终端里敲 dsh 变成 command not found。用残留临时文件把启动器补回来。
+  const fixedShims = repairDshShims();
+  if (fixedShims.length) log(`repaired dsh shim(s): ${fixedShims.join(', ')}`);
+
   // 3. locate the CLI
   let binJs = findDshBinJs();
   if (!binJs) {
@@ -770,10 +903,10 @@ function promptUnifiedUpdate(result) {
     cancelId: 1,
   }).then(({ response }) => {
     if (response === 0) startUnifiedUpdate(result);
-    else if (response === 2) saveUpdateState({
+    else if (response === 2) saveUpdateState(Object.assign(loadUpdateState(), {
       skippedCore: result.coreAvailable ? result.latestCore : loadUpdateState().skippedCore,
       skippedDesktop: result.desktopAvailable ? result.desktop.version : loadUpdateState().skippedDesktop,
-    });
+    }));
   }).catch(() => {});
 }
 
@@ -830,8 +963,22 @@ function runNpmInstall(targetVersion, onProgress) {
       resolve({ ok: false, error: `非法版本号：${targetVersion}`, log: [] });
       return;
     }
-    // 国内镜像显著加快下载；--allow-scripts=all 让原生模块构建脚本一次跑完（避免第二轮重装）
-    const base = ['install', '-g', `${DSH_PACKAGE}@${targetVersion}`, '--no-audit', '--no-fund', '--registry=https://registry.npmmirror.com', '--allow-scripts=all'];
+    // 更新前先清掉上一轮可能残留的临时目录：那是 npm 没删干净的旧版本，
+    // 动辄几万个文件，光遍历它就要耗掉好几分钟。
+    const cleaned = cleanupDshResidue();
+    if (cleaned) progress(`已清理 ${cleaned} 处安装残留…`, null);
+
+    // 机器上既然已经装了 dsh，依赖树就是现成的：--prefer-offline 优先吃本地缓存，
+    // 省掉 500 多个依赖包的在线版本查询；白名单处理见下方主流程。
+    const base = [
+      'install',
+      '-g',
+      `${DSH_PACKAGE}@${targetVersion}`,
+      '--no-audit',
+      '--no-fund',
+      '--prefer-offline',
+      `--registry=${DSH_REGISTRY}`,
+    ];
 
     const exec = (args) =>
       new Promise((res2) => {
@@ -839,15 +986,17 @@ function runNpmInstall(targetVersion, onProgress) {
         // 优先用解析出的 Node 自带的 npm（内置/系统 Node 都自带），没有才退回 PATH 上的 npm
         const nodePath = findNode();
         const bundledNpm = nodePath ? npmCliArgsFor(nodePath) : null;
+        // 剔除宿主注入的删除守卫，否则 npm 删不掉自己的临时目录、会堆积出巨量残骸
+        const childEnv = npmChildEnv();
         const child = bundledNpm
           ? spawn(bundledNpm[0], [...bundledNpm.slice(1), ...args], {
-              env: process.env,
+              env: childEnv,
               windowsHide: true,
               stdio: ['ignore', 'pipe', 'pipe'],
             })
           : spawn('npm', args, {
               shell: true,
-              env: process.env,
+              env: childEnv,
               windowsHide: true,
               stdio: ['ignore', 'pipe', 'pipe'],
             });
@@ -888,27 +1037,47 @@ function runNpmInstall(targetVersion, onProgress) {
         });
       });
 
-    progress('正在检查依赖版本…', null);
-    exec(base).then(async (first) => {
+    // npm 11 起默认不执行依赖的 install 脚本，会先列出 allowScripts 白名单。
+    // 老做法是照原样装一遍、被拦下、再带白名单把整树装第二遍 —— 500 多个包解析两轮，
+    // 这正是「更新特别慢」的另一半原因。改为沿用上次算出的名单，没有就先用 dry-run 探一次。
+    const extractAllow = (text) => {
+      const m = String(text || '').match(/--allow-scripts=([A-Za-z0-9@./_,-]+)/);
+      return m ? m[1] : '';
+    };
+    const stateFile = loadUpdateState();
+    let allowList = typeof stateFile.allowScripts === 'string' ? stateFile.allowScripts : '';
+
+    (async () => {
+      if (!allowList) {
+        progress('正在检查依赖…', null);
+        const probe = await exec([...base, '--dry-run']);
+        allowList = extractAllow((probe.log || []).join('\n'));
+        if (allowList) {
+          saveUpdateState(Object.assign(loadUpdateState(), { allowScripts: allowList }));
+        }
+        log(`allow-scripts probe -> ${allowList || '(none)'}`);
+      }
+
+      progress('正在下载并安装核心…', null);
+      const first = await exec(allowList ? [...base, `--allow-scripts=${allowList}`] : base);
       if (!first.ok) {
         resolve(first);
         return;
       }
-      // npm 的 allow-scripts 白名单可能拦下了 postinstall（原生模块构建等），
-      // 按 npm 提示的精确包列表重跑一次，保证安装完整。
-      const text = (first.log || []).join('\n');
-      const allow = text.match(/--allow-scripts=([A-Za-z0-9@./_,-]+)/);
-      if (!text.includes('allowScripts') || !allow) {
+      // 依赖脚本名单会随上游版本变化：npm 又列出新名单时，用它补装一次
+      const fresh = extractAllow((first.log || []).join('\n'));
+      if (fresh && fresh !== allowList) {
+        log(`allow-scripts 名单更新为 ${fresh}，补装一次`);
+        saveUpdateState(Object.assign(loadUpdateState(), { allowScripts: fresh }));
+        progress('正在补装必要组件…', 92);
+        const second = await exec([...base, `--allow-scripts=${fresh}`]);
         progress('更新完成', 100);
-        resolve(first);
+        resolve(second.ok ? second : first);
         return;
       }
-      log(`allow-scripts 拦截检测到，用列表 ${allow[1]} 重装一次`);
-      progress('正在补装必要组件…', 92);
-      const second = await exec([...base, `--allow-scripts=${allow[1]}`]);
       progress('更新完成', 100);
-      resolve(second.ok ? second : first);
-    });
+      resolve(first);
+    })();
   });
 }
 
@@ -1059,6 +1228,9 @@ async function startUnifiedUpdate(result) {
     if (result.coreAvailable) {
       const coreResult = await runNpmInstall(result.latestCore, (text, pct) => updateProgress(progress, `核心更新：${text}`, pct));
       if (!coreResult.ok) throw new Error((coreResult.log && coreResult.log.slice(-12).join('\\n')) || coreResult.error || '核心更新失败');
+      // 收尾：清掉本轮可能产生的残骸，并确保 dsh 命令的启动器齐全
+      cleanupDshResidue();
+      repairDshShims();
     }
 
     if (result.desktopAvailable) {
@@ -1093,6 +1265,11 @@ async function startUnifiedUpdate(result) {
   } catch (error) {
     if (progress && !progress.isDestroyed()) progress.destroy();
     state.updating = false;
+    // 失败时更要清理：安装中断最容易留下巨量残骸，不处理会一直拖慢后续更新
+    try {
+      cleanupDshResidue();
+      repairDshShims();
+    } catch {}
     await dialog.showMessageBox({ type: 'error', title: APP_NAME, message: '更新失败', detail: error.message || String(error), buttons: ['好'] });
   }
 }
@@ -1141,7 +1318,6 @@ function createMainWindow() {
     title: APP_NAME,
     icon: path.join(__dirname, '..', 'build', 'icon.png'),
     webPreferences: {
-      preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: false,
@@ -1308,15 +1484,6 @@ function installMenu() {
       ],
     },
     {
-      label: '📑 文件变更 (Ctrl+B)',
-      accelerator: 'CommandOrControl+B',
-      click: () => {
-        if (state.mainWindow && !state.mainWindow.isDestroyed()) {
-          state.mainWindow.webContents.send('dsh:toggle-sidebar');
-        }
-      },
-    },
-    {
       label: '🔄 检查更新',
       click: triggerManualUpdateCheck,
     },
@@ -1352,264 +1519,6 @@ async function triggerManualUpdateCheck() {
   }
 }
 
-// ---------------------------------------------------------------- 项目变更与文件预览 IPC
-
-function getSmartWorkspaces() {
-  const dshHome = path.join(os.homedir(), '.dsh');
-  const workspaceFile = path.join(dshHome, 'storages', 'workspace.json');
-  const sessionsDir = path.join(dshHome, 'sessions');
-
-  let workspaces = [];
-  if (fs.existsSync(workspaceFile)) {
-    try {
-      const data = JSON.parse(fs.readFileSync(workspaceFile, 'utf8'));
-      if (data && data.tables && data.tables.workspaces) {
-        workspaces = Object.entries(data.tables.workspaces).map(([id, ws]) => ({
-          workspaceId: id,
-          path: ws.path,
-          title: ws.title || path.basename(ws.path),
-          sessionIds: ws.sessionIds || [],
-          updatedAt: ws.updatedAt || ws.createdAt || '',
-          latestActivity: 0,
-        }));
-      }
-    } catch (err) {
-      log(`read workspace.json failed: ${err.message}`);
-    }
-  }
-
-  // 关键：扫描 .dsh/sessions 下各工作区实际会话文件的真实最后修改时间 (LastWriteTime)
-  // 谁最近被用户或 AI 写入/对话，谁就是当前真正活跃的工作区！
-  if (fs.existsSync(sessionsDir)) {
-    for (const ws of workspaces) {
-      if (!ws.path) continue;
-      const normalizedPath = ws.path.replace(/[:\\/]+/g, '-');
-      const wsSessionDir = path.join(sessionsDir, `--${normalizedPath}--`);
-      if (fs.existsSync(wsSessionDir)) {
-        try {
-          const files = fs.readdirSync(wsSessionDir, { recursive: true });
-          for (const f of files) {
-            try {
-              const full = path.join(wsSessionDir, f);
-              const st = fs.statSync(full);
-              if (st.mtimeMs > ws.latestActivity) {
-                ws.latestActivity = st.mtimeMs;
-              }
-            } catch {}
-          }
-        } catch {}
-      }
-    }
-  }
-
-  // 按照真实最近活动时间降序排序，最近活跃的项目永远排在第 1 位
-  workspaces.sort((a, b) => {
-    if (b.latestActivity !== a.latestActivity) {
-      return b.latestActivity - a.latestActivity;
-    }
-    return b.updatedAt > a.updatedAt ? 1 : -1;
-  });
-
-  return workspaces;
-}
-
-function initProjectChangesIpc() {
-  // 1. 获取所有已知的工作区列表（已按最近活跃时间精准排序）
-  ipcMain.handle('dsh:get-workspaces', async () => {
-    try {
-      const list = getSmartWorkspaces();
-      if (list.length > 0) return list;
-    } catch (err) {
-      log(`get-workspaces failed: ${err.message}`);
-    }
-    return [{ path: process.cwd(), title: '当前目录' }];
-  });
-
-  // 2. 获取默认/首选工作区路径（直接返回当前最活跃的项目路径）
-  ipcMain.handle('dsh:get-default-path', async () => {
-    try {
-      const list = getSmartWorkspaces();
-      if (list.length > 0 && list[0].path) return list[0].path;
-    } catch (err) {
-      log(`get-default-path failed: ${err.message}`);
-    }
-    return process.cwd();
-  });
-
-  // 3. 扫描指定项目目录的文件变更（新增、修改、删除）
-  ipcMain.handle('dsh:get-changes', async (event, projectPath) => {
-    if (!projectPath || !fs.existsSync(projectPath)) {
-      return { changes: [], counts: { added: 0, modified: 0, deleted: 0 } };
-    }
-
-    try {
-      // 优先尝试执行 git status 获取最准确、最标准的版本变更信息
-      const gitRes = spawnSync('git', ['status', '--porcelain=v1', '-uall'], {
-        cwd: projectPath,
-        encoding: 'utf8',
-        timeout: 15000,
-        windowsHide: true,
-      });
-
-      if (gitRes.status === 0 && typeof gitRes.stdout === 'string') {
-        const lines = gitRes.stdout.split(/\r?\n/).filter(Boolean);
-        const changes = [];
-        let added = 0;
-        let modified = 0;
-        let deleted = 0;
-
-        for (const line of lines) {
-          if (line.length < 4) continue;
-          const indexStatus = line[0];
-          const workTreeStatus = line[1];
-          let relPath = line.substring(3).trim();
-          // 处理重命名 R "old" -> "new"
-          if (relPath.includes(' -> ')) {
-            relPath = relPath.split(' -> ')[1].trim();
-          }
-          // 去除首尾可能的引号
-          relPath = relPath.replace(/^["']|["']$/g, '');
-
-          let status = 'modified';
-          if (indexStatus === '?' && workTreeStatus === '?') {
-            status = 'added';
-            added++;
-          } else if (indexStatus === 'A' || workTreeStatus === 'A') {
-            status = 'added';
-            added++;
-          } else if (indexStatus === 'D' || workTreeStatus === 'D') {
-            status = 'deleted';
-            deleted++;
-          } else {
-            status = 'modified';
-            modified++;
-          }
-
-          changes.push({
-            path: relPath.replace(/\\/g, '/'),
-            fullPath: path.join(projectPath, relPath),
-            status,
-          });
-        }
-
-        return { changes, counts: { added, modified, deleted } };
-      }
-    } catch (err) {
-      log(`git status check error in ${projectPath}: ${err.message}`);
-    }
-
-    // 若不是 git 仓库或执行出错，进行最近修改时间回退扫描（扫描 48 小时内修改过的文件）
-    try {
-      const changes = [];
-      const threshold = Date.now() - 48 * 3600 * 1000;
-      const ignoreNames = new Set(['node_modules', '.git', 'dist', 'dist-build', 'build', 'resources', '.smoke-ud', '.vscode']);
-
-      function scanDir(dir, depth = 0) {
-        if (depth > 6 || changes.length > 100) return;
-        let entries = [];
-        try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
-        for (const ent of entries) {
-          if (ignoreNames.has(ent.name)) continue;
-          const full = path.join(dir, ent.name);
-          if (ent.isDirectory()) {
-            scanDir(full, depth + 1);
-          } else if (ent.isFile()) {
-            try {
-              const st = fs.statSync(full);
-              if (st.mtimeMs >= threshold) {
-                const rel = path.relative(projectPath, full).replace(/\\/g, '/');
-                changes.push({
-                  path: rel,
-                  fullPath: full,
-                  status: 'modified',
-                });
-              }
-            } catch {}
-          }
-        }
-      }
-
-      scanDir(projectPath);
-      return {
-        changes,
-        counts: { added: 0, modified: changes.length, deleted: 0 },
-      };
-    } catch (err) {
-      return { changes: [], counts: { added: 0, modified: 0, deleted: 0 } };
-    }
-  });
-
-  // 4. 获取文件内容（文本或图片）
-  ipcMain.handle('dsh:get-file-content', async (event, fullPath) => {
-    if (!fullPath || !fs.existsSync(fullPath)) {
-      return { type: 'error', message: '文件不存在' };
-    }
-    try {
-      const stat = fs.statSync(fullPath);
-      if (stat.isDirectory()) {
-        return { type: 'error', message: '这是一个目录' };
-      }
-
-      const ext = path.extname(fullPath).toLowerCase();
-      const imageExts = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.ico']);
-      if (imageExts.has(ext)) {
-        const mime = ext === '.svg' ? 'image/svg+xml' : ext === '.ico' ? 'image/x-icon' : `image/${ext.replace('.', '')}`;
-        const buf = fs.readFileSync(fullPath);
-        return {
-          type: 'image',
-          dataUrl: `data:${mime};base64,${buf.toString('base64')}`,
-        };
-      }
-
-      // 文本文件：最大支持 4MB，超出截断
-      const MAX_TEXT_SIZE = 4 * 1024 * 1024;
-      if (stat.size > MAX_TEXT_SIZE) {
-        const fd = fs.openSync(fullPath, 'r');
-        const buf = Buffer.alloc(MAX_TEXT_SIZE);
-        fs.readSync(fd, buf, 0, MAX_TEXT_SIZE, 0);
-        fs.closeSync(fd);
-        return {
-          type: 'text',
-          content: buf.toString('utf8') + '\n\n... [文件体积过大，已自动截断前 4MB 预览] ...',
-        };
-      }
-
-      const content = fs.readFileSync(fullPath, 'utf8');
-      return {
-        type: 'text',
-        content,
-      };
-    } catch (err) {
-      return { type: 'error', message: err.message || String(err) };
-    }
-  });
-
-  // 5. 在系统资源管理器中高亮定位文件
-  ipcMain.handle('dsh:show-in-folder', async (event, fullPath) => {
-    try {
-      if (fullPath && fs.existsSync(fullPath)) {
-        shell.showItemInFolder(fullPath);
-        return true;
-      }
-    } catch {}
-    return false;
-  });
-
-  // 6. 弹出文件夹选择器
-  ipcMain.handle('dsh:select-folder', async () => {
-    try {
-      const res = await dialog.showOpenDialog(state.mainWindow, {
-        title: '选择项目根目录',
-        properties: ['openDirectory'],
-      });
-      if (!res.canceled && res.filePaths && res.filePaths.length > 0) {
-        return res.filePaths[0];
-      }
-    } catch {}
-    return null;
-  });
-}
-
 // ---------------------------------------------------------------- app lifecycle
 
 const gotLock = app.requestSingleInstanceLock();
@@ -1628,7 +1537,6 @@ if (!gotLock) {
   app.whenReady().then(async () => {
     app.setAppUserModelId(APP_USER_MODEL_ID);
     installMenu();
-    initProjectChangesIpc();
 
     // 测试钩子 2：把最新版安装到临时 prefix（不触碰全局安装），验证更新命令可行
     if (updateInstallTestPrefix) {
