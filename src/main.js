@@ -955,6 +955,23 @@ function updateProgress(win, statusText, pct) {
   win.webContents.executeJavaScript(script).catch(() => {});
 }
 
+/**
+ * 决定把新版本装到哪里。
+ *
+ * 应用自带核心（bundle）时，就地把新版装进内置 bundle —— 这条路完全用应用
+ * 内置的 Node/npm，**不需要目标机器装任何环境**；
+ * 否则退回 npm 的全局安装（机器上本来就有全局 dsh 的场景）。
+ */
+function dshInstallTarget() {
+  const bundledBin = bundledDshBinJs();
+  const current = findDshBinJs();
+  const bundleDir = path.join(bundledBase(), 'dsh', 'bundle');
+  const isBundled = !current || path.resolve(current) === path.resolve(bundledBin);
+  return isBundled
+    ? { prefixArgs: ['--prefix', bundleDir], where: bundleDir, bundled: true }
+    : { prefixArgs: ['-g'], where: '全局安装目录', bundled: false };
+}
+
 function runNpmInstall(targetVersion, onProgress) {
   const progress = onProgress || (() => {});
   return new Promise((resolve) => {
@@ -968,11 +985,14 @@ function runNpmInstall(targetVersion, onProgress) {
     const cleaned = cleanupDshResidue();
     if (cleaned) progress(`已清理 ${cleaned} 处安装残留…`, null);
 
-    // 机器上既然已经装了 dsh，依赖树就是现成的：--prefer-offline 优先吃本地缓存，
-    // 省掉 500 多个依赖包的在线版本查询；白名单处理见下方主流程。
+    // 就地更新内置核心时用 --prefix 指向 bundle；有全局安装时才用 -g。
+    // 前者完全依赖应用自带环境，干净电脑也能更新。
+    const target = dshInstallTarget();
+    log(`update target: ${target.where}${target.bundled ? ' (bundled)' : ''}`);
+
     const base = [
       'install',
-      '-g',
+      ...target.prefixArgs,
       `${DSH_PACKAGE}@${targetVersion}`,
       '--no-audit',
       '--no-fund',
@@ -1037,29 +1057,58 @@ function runNpmInstall(targetVersion, onProgress) {
         });
       });
 
-    // npm 11 起默认不执行依赖的 install 脚本，会先列出 allowScripts 白名单。
-    // 老做法是照原样装一遍、被拦下、再带白名单把整树装第二遍 —— 500 多个包解析两轮，
-    // 这正是「更新特别慢」的另一半原因。改为沿用上次算出的名单，没有就先用 dry-run 探一次。
+    // npm 11 起默认不执行依赖的 install 脚本（原生模块二进制就靠这些脚本落地）。
+    // 全局安装用 --allow-scripts=... 传名单；但 --prefix（就地更新内置核心）模式下
+    // 该参数不被接受，必须写进安装根的 package.json。
+    const DEFAULT_ALLOW_SCRIPTS =
+      '@deepseek-ai/dsh-subprocess-local,koffi,node-pty,@google/genai,protobufjs';
     const extractAllow = (text) => {
       const m = String(text || '').match(/--allow-scripts=([A-Za-z0-9@./_,-]+)/);
       return m ? m[1] : '';
     };
     const stateFile = loadUpdateState();
     let allowList = typeof stateFile.allowScripts === 'string' ? stateFile.allowScripts : '';
+    // 内置模式下探测不到名单时兜底，否则原生模块的安装脚本会被全部拦掉
+    if (!allowList) allowList = DEFAULT_ALLOW_SCRIPTS;
+
+    // 内置模式：把名单落到 bundle/.npmrc（幂等，安装前写即可）
+    const applyBundledAllowScripts = (list) => {
+      if (!target.bundled) return;
+      const names = String(list || '').split(',').map((s) => s.trim()).filter(Boolean);
+      const npmrcPath = path.join(target.where, '.npmrc');
+      try {
+        fs.writeFileSync(npmrcPath, `allow-scripts=${names.join(',')}\n`, 'utf8');
+        log(`bundled .npmrc allow-scripts -> ${names.join(',') || '(空)'}`);
+      } catch (err) {
+        log(`写 bundle/.npmrc 失败: ${err.message}`);
+      }
+    };
+
+    // 内置模式不传参数（走 package.json），全局模式才传 --allow-scripts
+    const allowArgs = (list) => (target.bundled ? [] : list ? [`--allow-scripts=${list}`] : []);
 
     (async () => {
-      if (!allowList) {
-        progress('正在检查依赖…', null);
-        const probe = await exec([...base, '--dry-run']);
-        allowList = extractAllow((probe.log || []).join('\n'));
-        if (allowList) {
-          saveUpdateState(Object.assign(loadUpdateState(), { allowScripts: allowList }));
+      // 全局模式才需要先探真实名单；内置模式用默认名单直接写入 package.json
+      if (!target.bundled) {
+        const known = typeof stateFile.allowScripts === 'string' ? stateFile.allowScripts : '';
+        if (!known) {
+          progress('正在检查依赖…', null);
+          const probe = await exec([...base, '--dry-run']);
+          const probed = extractAllow((probe.log || []).join('\n'));
+          if (probed) {
+            allowList = probed;
+            saveUpdateState(Object.assign(loadUpdateState(), { allowScripts: probed }));
+          }
+          log(`allow-scripts probe -> ${probed || '(none)'}`);
+        } else {
+          allowList = known;
         }
-        log(`allow-scripts probe -> ${allowList || '(none)'}`);
       }
 
+      applyBundledAllowScripts(allowList);
+
       progress('正在下载并安装核心…', null);
-      const first = await exec(allowList ? [...base, `--allow-scripts=${allowList}`] : base);
+      const first = await exec([...base, ...allowArgs(allowList)]);
       if (!first.ok) {
         resolve(first);
         return;
@@ -1069,8 +1118,9 @@ function runNpmInstall(targetVersion, onProgress) {
       if (fresh && fresh !== allowList) {
         log(`allow-scripts 名单更新为 ${fresh}，补装一次`);
         saveUpdateState(Object.assign(loadUpdateState(), { allowScripts: fresh }));
+        applyBundledAllowScripts(fresh);
         progress('正在补装必要组件…', 92);
-        const second = await exec([...base, `--allow-scripts=${fresh}`]);
+        const second = await exec([...base, ...allowArgs(fresh)]);
         progress('更新完成', 100);
         resolve(second.ok ? second : first);
         return;
