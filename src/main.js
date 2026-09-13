@@ -388,6 +388,57 @@ function repairDshShims() {
 }
 
 /**
+ * dsh 用 .lock 文件做写互斥，锁内容记录持有者的 PID。
+ * 进程异常退出（崩溃、被强杀）时锁不会被释放，此后每次启动都会卡在
+ * 「timed out waiting for the writer lock」而打不开 —— 表现为应用莫名启动失败。
+ * 这里在拉起 dsh 前探测：持有者已不存在就删掉这把死锁。
+ */
+function cleanupStaleDshLocks() {
+  const dshHome = path.join(os.homedir(), '.dsh');
+  let entries = [];
+  try {
+    entries = fs.readdirSync(dshHome);
+  } catch {
+    return 0;
+  }
+
+  let cleaned = 0;
+  for (const name of entries) {
+    if (!name.endsWith('.lock')) continue;
+    const lockPath = path.join(dshHome, name);
+    let raw = '';
+    try {
+      raw = fs.readFileSync(lockPath, 'utf8').trim();
+    } catch {
+      continue;
+    }
+
+    const pid = Number(raw.split(/\s+/)[0]);
+    if (Number.isInteger(pid) && pid > 0) {
+      let alive = false;
+      try {
+        process.kill(pid, 0); // 信号 0 只探测进程是否存在，不真正发信号
+        alive = true;
+      } catch (error) {
+        // EPERM 表示进程存在但无权限操作 —— 仍算活着，不能误删
+        alive = Boolean(error && error.code === 'EPERM');
+      }
+      if (alive) continue;
+    }
+
+    try {
+      fs.rmSync(lockPath, { force: true });
+      log(`removed stale lock ${lockPath} (pid ${raw || 'unknown'})`);
+      cleaned += 1;
+    } catch (error) {
+      log(`stale lock cleanup failed ${lockPath} (${error.message})`);
+    }
+  }
+  if (cleaned) log(`cleaned ${cleaned} stale dsh lock(s)`);
+  return cleaned;
+}
+
+/**
  * 某些宿主（CLI 沙箱）会通过 NODE_OPTIONS 注入删除守卫，把 Node 的删除调用
  * 改道到回收站。它会连带让 npm 删不掉自己的临时目录，堆积出几万文件的残骸。
  * 给 npm 子进程剔除这层注入，恢复正常的删除能力。
@@ -651,6 +702,11 @@ async function bootServer() {
   const explicit = cliPortArg !== null || process.env.DSH_PORT;
   const requested = cliPortArg !== null ? Number(cliPortArg) : Number(process.env.DSH_PORT);
   const target = explicit && Number.isInteger(requested) && requested > 0 ? requested : DEFAULT_PORT;
+
+  // 0. dsh 异常退出会留下未释放的 .lock（锁里记着已消失的 PID），
+  //    使后续每次启动都卡在「timed out waiting for the writer lock」。
+  //    拉起之前先清掉这些死锁，避免应用莫名打不开。
+  cleanupStaleDshLocks();
 
   // 1. attach to an already-running DSH instance
   if (await isDshOnPort(target)) {
