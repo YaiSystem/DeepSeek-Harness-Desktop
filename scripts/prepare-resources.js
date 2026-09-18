@@ -134,7 +134,8 @@ function main() {
         `${DSH_PACKAGE}@${target}`,
         '--no-audit',
         '--no-fund',
-        '--prefer-offline',
+        // 不要加 --prefer-offline：它跳过缓存新鲜度检查，会让本地陈旧的元数据
+        // 被直接采信，新版本号的依赖解析不出来（ETARGET / No matching version found）
         `--registry=${NPM_REGISTRY}`,
         '--loglevel=warn',
       ],

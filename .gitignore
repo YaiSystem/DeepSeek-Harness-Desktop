@@ -14,6 +14,11 @@ upd-*.json
 "DeepSeek Harness/"
 DeepSeek Harness/
 
+# 二进制/安装包（体积大，不进仓库；产物由 Release 分发）
+*.exe
+*.msi
+*.dll
+
 # 系统杂项
 .DS_Store
 Thumbs.db

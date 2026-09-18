@@ -1046,13 +1046,17 @@ function runNpmInstall(targetVersion, onProgress) {
     const target = dshInstallTarget();
     log(`update target: ${target.where}${target.bundled ? ' (bundled)' : ''}`);
 
+    // 注意：这里不能用 --prefer-offline。
+    // 它的语义是「跳过缓存新鲜度检查」，于是本地那份陈旧的 registry 元数据
+    // 会被直接采信 —— 新版本号根本不在里面，解析直接报
+    // ETARGET / No matching version found。升级场景必须让 npm 去查线上元数据，
+    // 那点解析耗时换不来「更新整个失败」。
     const base = [
       'install',
       ...target.prefixArgs,
       `${DSH_PACKAGE}@${targetVersion}`,
       '--no-audit',
       '--no-fund',
-      '--prefer-offline',
       `--registry=${DSH_REGISTRY}`,
     ];
 
